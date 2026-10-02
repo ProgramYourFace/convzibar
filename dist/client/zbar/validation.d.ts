@@ -1,13 +1,9 @@
 import type { ZbarInternal } from "../internal";
 /**
- * Verify that the (subject.type, relation, object.type) triple is consistent
- * with what the schema declares. Throws a descriptive error otherwise.
- *
- * "Valid subject types" are collected from every declaration on the relation:
- * bare entity-type strings, typed-target objects, userset references, and
- * local-relation references (recursively expanded). Dot-path declarations
- * contribute no direct subject types — a relation with only dot-paths is
- * derived and cannot be written directly.
+ * Verify that a fact `(subject, relation, object)` may be written: the
+ * relation exists and is writable (not a permission), and the subject's type
+ * is a facts arm of the relation or of a relation it inherits (expansions
+ * imply their type). Throws a descriptive error otherwise.
  */
 export declare function validateRelationParameter(z: ZbarInternal, subject: {
     type: string;

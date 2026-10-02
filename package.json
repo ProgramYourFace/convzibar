@@ -6,7 +6,7 @@
   "bugs": {
     "url": "https://github.com/AllAware/convzibar/issues"
   },
-  "version": "2.0.0",
+  "version": "3.0.0",
   "license": "Apache-2.0",
   "keywords": [
     "convex",
@@ -52,10 +52,6 @@
       "types": "./dist/react/index.d.ts",
       "default": "./dist/react/index.js"
     },
-    "./unsafe": {
-      "types": "./dist/client/unsafe.d.ts",
-      "default": "./dist/client/unsafe.js"
-    },
     "./test": "./src/test.ts",
     "./_generated/component.js": {
       "types": "./dist/component/_generated/component.d.ts"
@@ -73,7 +69,7 @@
     }
   },
   "peerDependencies": {
-    "convex": "^1.33.1",
+    "convex": "^1.45.0",
     "react": "^18.3.1 || ^19.0.0"
   },
   "devDependencies": {
@@ -86,8 +82,8 @@
     "@types/react-dom": "^19.2.3",
     "@vitejs/plugin-react": "^5.2.0",
     "chokidar-cli": "3.0.0",
-    "convex": "1.33.1",
-    "convex-test": "^0.0.41",
+    "convex": "1.45.0",
+    "convex-test": "^0.0.59",
     "eslint": "9.39.4",
     "eslint-plugin-react": "^7.37.5",
     "eslint-plugin-react-hooks": "^7.0.1",
@@ -107,6 +103,7 @@
   "types": "./dist/client/index.d.ts",
   "module": "./dist/client/index.js",
   "dependencies": {
-    "@convex-dev/workpool": "^0.4.6"
+    "@convex-dev/workpool": "^0.4.11",
+    "convex-helpers": "0.1.123"
   }
 }

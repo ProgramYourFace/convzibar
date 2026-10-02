@@ -1,97 +1,104 @@
 /**
- * Shared helpers for walking `SchemaRelation` definitions.
+ * Arm parsing for the compiler (`helpers.ts`).
  *
- * The schema stores relation targets as a heterogeneous union (bare strings,
- * typed objects, userset strings, dot-paths, or arrays of the above). Multiple
- * modules need to discriminate and walk those shapes — keeping the
- * string-parsing rules in one place makes sure they stay consistent.
+ * The schema stores arms verbatim (strings and `materialize()` wrappers).
+ * Classifying them in one place keeps the grammar of CONTRACT.md §2 in one
+ * place: syntax decides walks / expands / inverse; a bare name is resolved
+ * against the entity's sets first and the entity types second.
  */
-/**
- * Classify a string reference found inside a relation def. The kind is
- * determined by syntax (dot-path, userset) first, then by lookup
- * (`localRelations` then `entities`), falling back to `unknown`.
- */
-export function classifyStringRef(raw, ctx) {
-    if (raw.includes(".")) {
-        const [source, target] = raw.split(".");
-        return { kind: "dotPath", source, target };
-    }
-    if (raw.includes("#")) {
-        const [entityType, targetRelation] = raw.split("#");
-        return { kind: "userset", entityType, targetRelation };
-    }
-    if (ctx.localRelations && raw in ctx.localRelations) {
-        return { kind: "localRef", relation: raw };
-    }
-    if (raw in ctx.entities) {
-        return { kind: "entity", entityType: raw };
-    }
-    return { kind: "unknown", raw };
+/** Split `a<sep>b` into exactly two non-empty segments, or undefined. */
+function pair(raw, sep) {
+    const parts = raw.split(sep);
+    return parts.length === 2 && parts[0] && parts[1]
+        ? [parts[0], parts[1]]
+        : undefined;
 }
 /**
- * Iterate the targets of a relation def, yielding one tagged shape per
- * entry. Handles the array-or-single wrapping and the string / typed
- * dispatch — callers match on `kind` instead of re-parsing strings.
+ * Classify one arm. Syntax first (exactly one of `~…#`, `#`, `.`), then a
+ * bare name resolves to a local set before an entity type, so a schema can
+ * always say "inherit `admin`" even if an entity were also called `admin`.
  */
-export function* iterateRelationTargets(relDef, ctx) {
-    if (relDef === undefined || relDef === null)
+function classifyStringRef(arm, ctx) {
+    const materialized = typeof arm === "object";
+    const raw = typeof arm === "object" ? arm.materialize : arm;
+    const invalid = (reason) => ({
+        kind: "invalid",
+        raw,
+        materialized,
+        reason,
+    });
+    const hasHash = raw.includes("#");
+    const hasDot = raw.includes(".");
+    const hasTilde = raw.includes("~");
+    if ((hasHash && hasDot) || (hasTilde && (!raw.startsWith("~") || !hasHash))) {
+        return invalid("an arm uses exactly one of '#', '.' or a leading '~#'");
+    }
+    if (hasTilde) {
+        const p = pair(raw.slice(1), "#");
+        if (!p || raw.slice(1).includes("~"))
+            return invalid("an inverse is written '~type#relation'");
+        return {
+            kind: "inverse",
+            subjectType: p[0],
+            relation: p[1],
+            raw,
+            materialized,
+        };
+    }
+    if (hasHash) {
+        const p = pair(raw, "#");
+        if (!p)
+            return invalid("an expansion is written 'type#relation'");
+        return {
+            kind: "expands",
+            subjectType: p[0],
+            targetSet: p[1],
+            raw,
+            materialized,
+        };
+    }
+    if (hasDot) {
+        const p = pair(raw, ".");
+        if (!p)
+            return invalid("a walk must have exactly two segments ('relation.set')");
+        return {
+            kind: "walks",
+            viaRelation: p[0],
+            targetSet: p[1],
+            raw,
+            materialized,
+        };
+    }
+    if (ctx.localSets.has(raw))
+        return { kind: "inherits", set: raw, raw, materialized };
+    if (ctx.entities.has(raw))
+        return { kind: "facts", subjectType: raw, raw, materialized };
+    return { kind: "unknown", raw, materialized };
+}
+/**
+ * Classify every arm of one set (`undefined`: a set with no arms). Anything
+ * that is neither a string nor `{ materialize: string }` is invalid.
+ */
+export function* iterateRelationTargets(arms, ctx) {
+    if (arms === undefined || arms === null)
         return;
-    const defs = Array.isArray(relDef) ? relDef : [relDef];
-    for (const d of defs) {
+    for (const d of Array.isArray(arms) ? arms : [arms]) {
         if (typeof d === "string") {
             yield classifyStringRef(d, ctx);
-            continue;
         }
-        if (typeof d !== "object" || d === null)
-            continue;
-        if ("type" in d && typeof d.type === "string") {
-            const reverse = "reverse" in d && typeof d.reverse === "string"
-                ? d.reverse
-                : undefined;
+        else if (d &&
+            typeof d === "object" &&
+            typeof d.materialize === "string") {
+            yield classifyStringRef(d, ctx);
+        }
+        else {
             yield {
-                kind: "typed",
-                entityType: d.type,
-                reverse,
+                kind: "invalid",
+                raw: JSON.stringify(d),
+                materialized: false,
+                reason: "not an arm",
             };
         }
     }
-}
-/**
- * Expand a seed set of relation names into every relation name they
- * transitively contain via local userset rewrites on `objectType`.
- */
-export function expandRelationTargets(schema, objectType, seed, options = {}) {
-    const strict = options.strictLocalRefs ?? false;
-    const localRelations = schema.entities[objectType]?.relations ?? {};
-    const results = [];
-    const seen = new Set();
-    const recurseString = (ref) => {
-        if (ref.includes("."))
-            return;
-        if (strict) {
-            if (ref.includes("#"))
-                return;
-            if (localRelations[ref] === undefined)
-                return;
-        }
-        expand(ref);
-    };
-    const expand = (rel) => {
-        if (seen.has(rel))
-            return;
-        seen.add(rel);
-        results.push(rel);
-        const relDef = localRelations[rel];
-        if (!relDef)
-            return;
-        const defs = Array.isArray(relDef) ? relDef : [relDef];
-        for (const d of defs) {
-            if (typeof d === "string")
-                recurseString(d);
-        }
-    };
-    for (const s of seed)
-        expand(s);
-    return results;
 }
 //# sourceMappingURL=relation-def.js.map

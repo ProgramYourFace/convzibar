@@ -1,323 +1,410 @@
-import { expandRelationTargets, iterateRelationTargets, } from "../shared/relation-def";
-function expandRelation(schema, objectType, relation) {
-    return expandRelationTargets(schema, objectType, [relation], {
-        strictLocalRefs: true,
-    });
+/**
+ * The schema compiler: `ZbarSchema` (what the builder stores) → `GraphConfig`
+ * v2 (what both evaluators read). CONTRACT.md is the specification; this file
+ * resolves names, rejects schemas the evaluators cannot agree on, and
+ * precomputes the closures, lineage bounds and materialization rules so
+ * neither evaluator re-derives them (a second derivation is a second chance
+ * to disagree).
+ *
+ * Two phases: `compileSets` (every arm classified and resolved, the inherits
+ * closures) and `compileRules` (the materialized arms flattened into rules,
+ * keyed by their content and their upstream). `boundLineage` then fills
+ * `maxLineage` and enforces the static half of CONTRACT §4.7.
+ */
+import { DEFAULT_MAX_DEPTH, DEFAULT_WRITE_BUDGET } from "./config";
+import { iterateRelationTargets } from "../shared/relation-def";
+const ERR = "Zbar Schema Error:";
+const setLabel = (objectType, name, writable) => `${writable ? "relation" : "permission"} '${name}' on '${objectType}'`;
+const byKey = (a, b) => (a < b ? -1 : a > b ? 1 : 0);
+/** Object with keys in sorted order, so the config's JSON (and hash) is the same in every process. */
+function sortedRecord(entries) {
+    return Object.fromEntries([...entries].sort(([a], [b]) => byKey(a, b)));
 }
-function getTargetEntityTypes(schema, objectType, relation) {
-    const expanded = expandRelation(schema, objectType, relation);
-    const types = new Set();
-    for (const exp of expanded) {
-        const relDef = schema.entities[objectType]?.relations?.[exp];
-        if (relDef) {
-            const defs = Array.isArray(relDef) ? relDef : [relDef];
-            for (const d of defs) {
-                if (typeof d === "string") {
-                    if (d.includes("#")) {
-                        // Userset target `type#rel` — the reachable entity is `type`.
-                        // Without this, a dot-path readTimeRelation whose source relation
-                        // targets its intermediate only through a userset compiles with an
-                        // empty `sourceTypes`, silently denying at read time.
-                        const usersetType = d.split("#")[0];
-                        if (schema.entities[usersetType])
-                            types.add(usersetType);
-                    }
-                    else if (schema.entities[d]) {
-                        types.add(d);
-                    }
-                }
-                else if (typeof d === "object" && d !== null && "type" in d) {
-                    if (typeof d.type === "string" &&
-                        schema.entities[d.type]) {
-                        types.add(d.type);
-                    }
-                }
-            }
-        }
+const armKey = (arm) => JSON.stringify(arm);
+/** FNV-1a (32-bit) of a string with the given offset basis, as 8 hex digits. */
+export function fnv1a(s, seed = 0x811c9dc5) {
+    let h = seed >>> 0;
+    for (let i = 0; i < s.length; i++) {
+        h ^= s.charCodeAt(i);
+        h = Math.imul(h, 0x01000193);
     }
-    return Array.from(types);
+    return (h >>> 0).toString(16).padStart(8, "0");
 }
-export function parseSchemaToGraphConfig(schema) {
-    // Deep-clone entities so that Pass 2 reverse-edge resolution does not
-    // mutate the caller's schema object. Use structuredClone rather than a
-    // JSON round-trip: JSON.stringify silently DROPS keys whose value is
-    // `undefined`, which is exactly how placeholder relations are stored
-    // (`.relation('admin')` with no target). Dropping them detaches any
-    // local-inheritance reference to a placeholder (e.g. `viewer: 'admin'`
-    // where `admin` is RT-derived), turning it into an "unknown" target.
-    schema = { ...schema, entities: structuredClone(schema.entities || {}) };
-    const rules = [];
-    // reverseEdges: objectType -> relation -> subjectType -> reverseRelation
-    const reverseEdges = {};
-    // First pass: collect all reverse edges declared via { type, reverse } syntax,
-    // keyed by (objectType, relation, subjectType). A single relation may target
-    // multiple entity types, each with its own reverse name.
-    //
-    // We store BOTH the forward entry and its INVERSE. The forward entry mirrors
-    // a written/declared edge to its reverse. The inverse entry is what mirrors a
-    // *derived* reverse-relation edge back to its forward relation at the
-    // effective level: e.g. when `system.contact_member` is materialised by a
-    // traversal, the BFS reverse-mirror uses the inverse to also materialise the
-    // declared `contact.owner` side. Dropping it breaks every primary-contact /
-    // reverse-derived effective edge (verified: 19 IoT tests).
-    for (const [entityType, def] of Object.entries(schema.entities || {})) {
-        const relations = def.relations || {};
-        for (const [relName, relDef] of Object.entries(relations)) {
-            const defs = Array.isArray(relDef) ? relDef : [relDef];
-            for (const item of defs) {
-                if (typeof item === "object" && item !== null && "reverse" in item) {
-                    const objItem = item;
-                    if (objItem.reverse) {
-                        reverseEdges[entityType] = reverseEdges[entityType] || {};
-                        reverseEdges[entityType][relName] =
-                            reverseEdges[entityType][relName] || {};
-                        reverseEdges[entityType][relName][objItem.type] = objItem.reverse;
-                        // Inverse entry: maps the reverse relation back to the forward one.
-                        reverseEdges[objItem.type] = reverseEdges[objItem.type] || {};
-                        reverseEdges[objItem.type][objItem.reverse] =
-                            reverseEdges[objItem.type][objItem.reverse] || {};
-                        reverseEdges[objItem.type][objItem.reverse][entityType] = relName;
+export function parseSchemaToGraphConfig(schema, options = {}) {
+    const maxDepth = options.maxDepth ?? DEFAULT_MAX_DEPTH;
+    const compiled = compileSets(schema);
+    const rules = compileRules(compiled);
+    boundLineage(compiled.sets, compiled.inherits, maxDepth);
+    return {
+        version: 2,
+        sets: sortedRecord(Object.entries(compiled.sets)),
+        inherits: sortedClosure(compiled.inherits),
+        factRelations: sortedClosure(compiled.factRelations),
+        rules,
+        maxDepth,
+        writeBudget: options.writeBudget ?? DEFAULT_WRITE_BUDGET,
+    };
+}
+function sortedClosure(c) {
+    return sortedRecord(Object.entries(c).map(([t, m]) => [t, sortedRecord(Object.entries(m))]));
+}
+function compileSets(schema) {
+    // Every set of every entity: name → { writable, arms as written }.
+    const raw = new Map();
+    for (const [entityType, def] of Object.entries(schema?.entities ?? {})) {
+        const sets = new Map();
+        for (const [name, arms] of Object.entries(def?.relations ?? {})) {
+            sets.set(name, { writable: true, arms });
+        }
+        for (const [name, arms] of Object.entries(def?.permissions ?? {})) {
+            if (sets.has(name)) {
+                throw new Error(`${ERR} '${name}' on '${entityType}' is declared as both a relation and a permission. A set has one name.`);
+            }
+            sets.set(name, { writable: false, arms });
+        }
+        raw.set(entityType, sets);
+    }
+    const entityNames = [...raw.keys()];
+    const entitySet = new Set(entityNames);
+    const setOf = (type, name) => raw.get(type)?.get(name);
+    // 1a. Classify every arm. Everything except walks is final here; walks
+    // need the via relation's subject types, which need the inherits closures.
+    const pending = new Map();
+    for (const [objectType, sets] of raw) {
+        const compiledSets = new Map();
+        for (const [name, { writable, arms }] of sets) {
+            const label = setLabel(objectType, name, writable);
+            // A set inheriting itself would be a no-op, so its own name resolves
+            // as an entity type: `.relation('system', 'system')` means facts.
+            const localSets = new Set([...sets.keys()].filter((s) => s !== name));
+            const out = [];
+            const push = (arm) => {
+                if (!out.some((a) => armKey(a) === armKey(arm)))
+                    out.push(arm);
+            };
+            for (const shape of iterateRelationTargets(arms, {
+                localSets,
+                entities: entitySet,
+            })) {
+                if (shape.kind === "invalid") {
+                    throw new Error(`${ERR} ${label} has arm '${shape.raw}': ${shape.reason}.`);
+                }
+                if (shape.kind === "unknown") {
+                    throw new Error(`${ERR} ${label} references '${shape.raw}', which is neither a relation or permission declared on '${objectType}' nor a known entity type. ` +
+                        `Use a declared set [${[...localSets].join(", ")}], an entity type [${entityNames.join(", ")}], ` +
+                        `a walk ('relation.set'), an expansion ('type#relation') or an inverse ('~type#relation').`);
+                }
+                if (shape.materialized) {
+                    if (!writable) {
+                        throw new Error(`${ERR} ${label} materializes '${shape.raw}'; nothing is ever written to a permission, so only relations may be materialized.`);
+                    }
+                    if (shape.kind !== "walks" && shape.kind !== "expands") {
+                        throw new Error(`${ERR} ${label} has materialize('${shape.raw}'); only walks ('relation.set') and expansions ('type#relation') can be materialized.`);
                     }
                 }
-            }
-        }
-    }
-    // Resolve reverse-edge target types into the receiving relation. When entity
-    // A declares { type: 'B', reverse: 'foo' }, B.foo must include A as an
-    // entity-type target so getTargetEntityTypes can discover what is reachable
-    // through B.foo. If B.foo is still an undefined placeholder, set it to A;
-    // if already populated (e.g. by .extend()), merge A in.
-    for (const [entityType, relMap] of Object.entries(reverseEdges)) {
-        for (const [relName] of Object.entries(relMap)) {
-            const targetEntity = schema.entities[entityType];
-            const relDef = targetEntity?.relations?.[relName];
-            if (!relDef)
-                continue;
-            const defs = Array.isArray(relDef) ? relDef : [relDef];
-            for (const d of defs) {
-                if (typeof d === "object" && d !== null && "reverse" in d) {
-                    const receiverEntity = d.type;
-                    const actualReverseName = d.reverse;
-                    if (!actualReverseName)
-                        continue;
-                    const receiverRels = schema.entities[receiverEntity]?.relations;
-                    if (!receiverRels)
-                        continue;
-                    const current = receiverRels[actualReverseName];
-                    if (current === undefined) {
-                        receiverRels[actualReverseName] = entityType;
-                    }
-                    else {
-                        const currentArr = Array.isArray(current) ? current : [current];
-                        if (!currentArr.includes(entityType)) {
-                            currentArr.push(entityType);
-                            receiverRels[actualReverseName] =
-                                currentArr.length === 1 ? currentArr[0] : currentArr;
+                switch (shape.kind) {
+                    case "facts":
+                        if (!writable) {
+                            throw new Error(`${ERR} ${label} has facts arm '${shape.subjectType}'; permissions are never written. Put the subject type on a relation and inherit that relation.`);
                         }
+                        push({ kind: "facts", subjectType: shape.subjectType });
+                        break;
+                    case "inherits":
+                        push({ kind: "inherits", set: shape.set });
+                        break;
+                    case "expands": {
+                        const target = setOf(shape.subjectType, shape.targetSet);
+                        if (!entitySet.has(shape.subjectType) || !target) {
+                            throw new Error(`${ERR} ${label} has arm '${shape.raw}', but ` +
+                                (entitySet.has(shape.subjectType)
+                                    ? `'${shape.subjectType}' declares no set '${shape.targetSet}'. Its sets: [${[...raw.get(shape.subjectType).keys()].join(", ")}].`
+                                    : `'${shape.subjectType}' is not an entity. Known entities: [${entityNames.join(", ")}].`));
+                        }
+                        if (!target.writable) {
+                            throw new Error(`${ERR} ${label} has arm '${shape.raw}', but '${shape.targetSet}' is a permission on '${shape.subjectType}'; # may target relations only; use a walk or inherit a relation.`);
+                        }
+                        // S2: an expansion makes its type a writable fact type of the
+                        // relation (a permission has no facts; its first hop reads the
+                        // facts of the relations it inherits).
+                        if (writable)
+                            push({ kind: "facts", subjectType: shape.subjectType });
+                        push({
+                            kind: "expands",
+                            subjectType: shape.subjectType,
+                            targetSet: shape.targetSet,
+                            materialized: shape.materialized,
+                        });
+                        break;
                     }
+                    case "walks":
+                        push({
+                            kind: "walks",
+                            viaRelation: shape.viaRelation,
+                            targetSet: shape.targetSet,
+                            materialized: shape.materialized,
+                            raw: shape.raw,
+                        });
+                        break;
+                    case "inverse":
+                        push({
+                            kind: "inverse",
+                            subjectType: shape.subjectType,
+                            relation: shape.relation,
+                        });
+                        break;
                 }
             }
+            compiledSets.set(name, out);
+        }
+        pending.set(objectType, compiledSets);
+    }
+    // 1b. Inherits closures (CONTRACT §2.4): `set` first, then what it inherits
+    // depth-first in declaration order, deduplicated.
+    const inherits = {};
+    const factRelations = {};
+    for (const [objectType, sets] of pending) {
+        inherits[objectType] = {};
+        factRelations[objectType] = {};
+        for (const name of sets.keys()) {
+            const closure = [];
+            const visit = (s) => {
+                if (closure.includes(s))
+                    return;
+                closure.push(s);
+                for (const arm of sets.get(s) ?? [])
+                    if (arm.kind === "inherits")
+                        visit(arm.set);
+            };
+            visit(name);
+            inherits[objectType][name] = closure;
+            factRelations[objectType][name] = closure.filter((s) => setOf(objectType, s).writable);
         }
     }
-    // Reject bare-string relation targets that resolve to neither a declared
-    // relation on the owning entity nor a known entity type. classifyStringRef
-    // tags these as `kind: "unknown"`, after which every downstream consumer
-    // silently ignores them — turning a one-character typo into a silent
-    // authorization gap. Surfacing it at schema load converts a
-    // deny-when-should-grant bug into a load-time error. Runs AFTER reverse-edge
-    // resolution so back-filled placeholder relations are seen as entity-typed.
-    for (const [entityType, def] of Object.entries(schema.entities || {})) {
-        const relations = (def.relations || {});
-        const classifyCtx = {
-            localRelations: relations,
-            entities: schema.entities,
-        };
-        for (const [relName, relDef] of Object.entries(relations)) {
-            for (const target of iterateRelationTargets(relDef, classifyCtx)) {
-                if (target.kind === "unknown") {
-                    const knownRelations = Object.keys(relations).filter((r) => r !== relName);
-                    const knownEntities = Object.keys(schema.entities || {});
-                    throw new Error(`Zbar Schema Error: relation '${relName}' on '${entityType}' references '${target.raw}', ` +
-                        `which is neither a relation declared on '${entityType}' nor a known entity type. ` +
-                        `Use a declared relation [${knownRelations.join(", ")}], an entity type [${knownEntities.join(", ")}], ` +
-                        `a dot-path ('source.target'), or a userset ('type#relation').`);
-                }
+    // The subject types a fact of `(objectType, set)` may have: the facts arms
+    // (declared or implied by an expansion) of every relation in its closure.
+    const subjectTypes = (objectType, set) => {
+        const types = [];
+        for (const member of factRelations[objectType]?.[set] ?? []) {
+            for (const arm of pending.get(objectType).get(member)) {
+                if (arm.kind === "facts" && !types.includes(arm.subjectType))
+                    types.push(arm.subjectType);
             }
         }
-    }
-    // Generate distant traversal rules with fully expanded local aliases.
-    // Note: we do NOT emit rules for local inheritance — that is computed in
-    // memory at read time to avoid write-time materialisation.
-    for (const [entityType, def] of Object.entries(schema.entities || {})) {
-        const relations = def.relations || {};
-        for (const [derivedRelName, relDef] of Object.entries(relations)) {
-            const defs = Array.isArray(relDef) ? relDef : [relDef];
-            for (const item of defs) {
-                if (typeof item !== "string")
-                    continue;
-                if (item.includes("#")) {
-                    // Userset expansion: e.g. 'group#viewer' on device's viewer relation
-                    // means "when a group is added as viewer of a device, expand through
-                    // that group's viewer relation to find transitive subjects." We
-                    // follow the local inheritance chain on the userset entity.
-                    const [usersetType, targetRelBase] = item.split("#");
-                    for (const target of expandRelation(schema, usersetType, targetRelBase)) {
-                        rules.push({
-                            sourceObjectType: entityType,
-                            sourceRelation: derivedRelName,
-                            targetRelation: target,
-                            derivedRelation: derivedRelName,
+        return types;
+    };
+    // 1c. Resolve walks per via type; check inverses.
+    const sets = {};
+    for (const [objectType, setArms] of pending) {
+        const compiled = [];
+        for (const [name, arms] of setArms) {
+            const writable = setOf(objectType, name).writable;
+            const label = setLabel(objectType, name, writable);
+            const out = [];
+            for (const arm of arms) {
+                if (arm.kind === "walks") {
+                    const via = setOf(objectType, arm.viaRelation);
+                    if (!via || !via.writable) {
+                        throw new Error(`${ERR} ${label} has arm '${arm.raw}', but '${arm.viaRelation}' is not a relation on '${objectType}'. A walk goes through a relation (its facts are the first hop).`);
+                    }
+                    const viaTypes = subjectTypes(objectType, arm.viaRelation);
+                    const matching = viaTypes.filter((t) => setOf(t, arm.targetSet));
+                    if (matching.length === 0) {
+                        throw new Error(`${ERR} ${label} has arm '${arm.raw}', but no type reachable through '${arm.viaRelation}' [${viaTypes.join(", ")}] declares a set '${arm.targetSet}'.`);
+                    }
+                    for (const viaType of matching) {
+                        out.push({
+                            kind: "walks",
+                            viaRelation: arm.viaRelation,
+                            viaType,
+                            targetSet: arm.targetSet,
+                            materialized: arm.materialized,
                         });
                     }
+                    continue;
                 }
-                else if (item.includes(".")) {
-                    const [sourceRelBase, targetRelBase] = item.split(".");
-                    for (const source of expandRelation(schema, entityType, sourceRelBase)) {
-                        for (const targetType of getTargetEntityTypes(schema, entityType, source)) {
-                            for (const target of expandRelation(schema, targetType, targetRelBase)) {
-                                rules.push({
-                                    sourceObjectType: entityType,
-                                    sourceRelation: source,
-                                    targetRelation: target,
-                                    derivedRelation: derivedRelName,
-                                });
-                            }
+                if (arm.kind === "inverse") {
+                    const target = setOf(arm.subjectType, arm.relation);
+                    const written = `~${arm.subjectType}#${arm.relation}`;
+                    if (!entitySet.has(arm.subjectType) || !target || !target.writable) {
+                        throw new Error(`${ERR} ${label} has arm '${written}', but '${arm.relation}' is not a relation on '${arm.subjectType}'. An inverse reads the facts of a relation.`);
+                    }
+                    const accepted = subjectTypes(arm.subjectType, arm.relation);
+                    if (!accepted.includes(objectType)) {
+                        throw new Error(`${ERR} ${label} has arm '${written}', but '${arm.subjectType}.${arm.relation}' does not accept '${objectType}' as a fact subject; it accepts [${accepted.join(", ")}].`);
+                    }
+                }
+                out.push(arm);
+            }
+            compiled.push([
+                name,
+                { objectType, name, writable, arms: out, maxLineage: null },
+            ]);
+        }
+        sets[objectType] = sortedRecord(compiled);
+    }
+    return { sets, inherits, factRelations, subjectTypes };
+}
+// ===========================================================================
+// Phase 2: rules (CONTRACT §5.1).
+// ===========================================================================
+/**
+ * One rule per (materialized arm × first-hop relation × intermediate type).
+ * The second hop of a rule may only read what exists as rows or facts
+ * (invariant 6), so a computed walk/expansion anywhere in the target's
+ * closure rejects the schema rather than letting the BFS silently derive
+ * less than the planner.
+ *
+ * Keys. A rule's base names its own content (derived set, first hop,
+ * intermediate, target and its second hop). A rule also depends on every
+ * rule whose derived relation its second hop reads; the key appends a
+ * fingerprint of the bases of all rules reachable that way (itself included,
+ * so a recursive group of rules shares one closed set), so an edit anywhere
+ * upstream changes the key and `rebuild` retires the old rows (CONTRACT §5.6).
+ */
+function compileRules({ sets, inherits, factRelations, subjectTypes, }) {
+    const bases = [];
+    const baseKeys = [];
+    for (const [objectType, byName] of Object.entries(sets)) {
+        for (const set of Object.values(byName)) {
+            for (const arm of set.arms) {
+                if ((arm.kind !== "expands" && arm.kind !== "walks") ||
+                    !arm.materialized)
+                    continue;
+                const intermediateType = arm.kind === "expands" ? arm.subjectType : arm.viaType;
+                const firstHopOf = arm.kind === "expands" ? set.name : arm.viaRelation;
+                const written = arm.kind === "expands"
+                    ? `${arm.subjectType}#${arm.targetSet}`
+                    : `${arm.viaRelation}.${arm.targetSet}`;
+                const inverses = [];
+                for (const member of inherits[intermediateType][arm.targetSet]) {
+                    for (const inner of sets[intermediateType][member].arms) {
+                        if ((inner.kind === "walks" || inner.kind === "expands") &&
+                            !inner.materialized) {
+                            throw new Error(`${ERR} \`${objectType}.${set.name}\`: materialized arm '${written}' reads \`${intermediateType}.${member}\`, which is computed at read time; materialize that arm too, or compute this one.`);
+                        }
+                        if (inner.kind === "inverse" &&
+                            !inverses.some((i) => i.subjectType === inner.subjectType &&
+                                i.relation === inner.relation)) {
+                            inverses.push({
+                                subjectType: inner.subjectType,
+                                relation: inner.relation,
+                            });
                         }
                     }
                 }
-            }
-        }
-    }
-    // Optimise traversal rules by pruning redundant local derivations. A rule is
-    // dominated when another rule on the same trigger edge derives a relation
-    // that the dominated rule's derived relation already contains via read-time
-    // local inheritance (so a query for it still finds the survivor).
-    const triggerGroups = new Map();
-    for (const rule of rules) {
-        const triggerKey = `${rule.sourceObjectType}:${rule.sourceRelation}:${rule.targetRelation}`;
-        if (!triggerGroups.has(triggerKey))
-            triggerGroups.set(triggerKey, []);
-        triggerGroups.get(triggerKey).push(rule);
-    }
-    const optimizedRules = rules.filter((ruleB) => {
-        const triggerKey = `${ruleB.sourceObjectType}:${ruleB.sourceRelation}:${ruleB.targetRelation}`;
-        const group = triggerGroups.get(triggerKey);
-        const i = group.indexOf(ruleB);
-        for (let j = 0; j < group.length; j++) {
-            if (i === j)
-                continue;
-            const ruleA = group[j];
-            const expandedB = expandRelation(schema, triggerKey.split(":")[0], ruleB.derivedRelation);
-            if (expandedB.includes(ruleA.derivedRelation)) {
-                if (ruleA.derivedRelation === ruleB.derivedRelation) {
-                    if (i > j)
-                        return false; // dominated
-                }
-                else {
-                    return false; // dominated
+                // A first-hop relation that can never hold a fact of the intermediate
+                // type would only produce a rule that never fires.
+                for (const relation of factRelations[objectType][firstHopOf]) {
+                    if (!subjectTypes(objectType, relation).includes(intermediateType))
+                        continue;
+                    const secondHop = {
+                        relations: [...factRelations[intermediateType][arm.targetSet]],
+                        inverses,
+                    };
+                    const base = `${objectType}.${set.name}<=${relation}:${intermediateType}#${arm.targetSet}` +
+                        `(${secondHop.relations.join(",")};${inverses.map((i) => `${i.subjectType}#${i.relation}`).join(",")})`;
+                    if (baseKeys.includes(base))
+                        continue;
+                    baseKeys.push(base);
+                    bases.push({
+                        objectType,
+                        derived: set.name,
+                        firstHop: { relation, intermediateType },
+                        secondHop,
+                    });
                 }
             }
         }
-        return true;
+    }
+    // ρ reads σ when σ derives a relation on ρ's intermediate type that ρ's second hop reads.
+    const reads = bases.map((rho) => bases
+        .map((sigma, j) => ({ sigma, j }))
+        .filter(({ sigma }) => sigma.objectType === rho.firstHop.intermediateType &&
+        rho.secondHop.relations.includes(sigma.derived))
+        .map(({ j }) => j));
+    const rules = bases.map((rule, i) => {
+        const reached = new Set([i]);
+        const stack = [i];
+        while (stack.length > 0) {
+            for (const j of reads[stack.pop()]) {
+                if (!reached.has(j)) {
+                    reached.add(j);
+                    stack.push(j);
+                }
+            }
+        }
+        const upstream = [...reached].map((j) => baseKeys[j]).sort(byKey);
+        return { key: `${baseKeys[i]}@${fnv1a(upstream.join("\n"))}`, ...rule };
     });
-    // Collect read-time relation declarations. These deliberately produce NO
-    // traversal rules — the BFS ignores them at write time.
-    const readTimePaths = [];
-    for (const [entityType, def] of Object.entries(schema.entities || {})) {
-        const rtRels = def.readTimeRelations;
-        if (!rtRels)
-            continue;
-        for (const rt of rtRels) {
-            if (rt.dotPath.includes("#")) {
-                const [sourceType, targetRelation] = rt.dotPath.split("#");
-                if (!sourceType || !targetRelation)
-                    continue;
-                // The derived relation must declare `sourceType` as a typed target —
-                // otherwise there's no way to write a subject of that type to it.
-                const derivedTargetTypes = getTargetEntityTypes(schema, entityType, rt.derivedRelation);
-                if (!derivedTargetTypes.includes(sourceType)) {
-                    throw new Error(`Zbar Schema Error: readTimeRelation('${rt.derivedRelation}', '${rt.dotPath}') on '${entityType}' requires '${rt.derivedRelation}' to declare '${sourceType}' as a typed target. Add it to the .relation('${rt.derivedRelation}', ...) declaration.`);
+    return rules.sort((a, b) => byKey(a.key, b.key));
+}
+// ===========================================================================
+// Lineage bounds (CONTRACT §4.7).
+// ===========================================================================
+/**
+ * `maxLineage` of every set: the most facts one derivation can use, over
+ * every arm of its inherits closure whether computed or materialized — facts
+ * and inverse 1, walks/expands 1 + the far set's — or null when the set
+ * reaches a cycle. A finite value above `maxDepth` is a schema error: such a
+ * chain would meet the bound with no recursion to blame, so it is refused at
+ * load and acyclic chains never meet the bound at runtime.
+ */
+function boundLineage(sets, inherits, maxDepth) {
+    const id = (t, s) => `${t}#${s}`;
+    const memo = new Map();
+    const longest = (objectType, name) => {
+        const key = id(objectType, name);
+        const known = memo.get(key);
+        if (known === "visiting")
+            return null; // on the stack: a cycle
+        if (known !== undefined)
+            return known;
+        memo.set(key, "visiting");
+        let best = 0;
+        for (const member of inherits[objectType]?.[name] ?? []) {
+            for (const arm of sets[objectType][member].arms) {
+                let len;
+                if (arm.kind === "facts" || arm.kind === "inverse")
+                    len = 1;
+                else if (arm.kind === "inherits")
+                    continue; // its members are in the closure
+                else {
+                    const far = arm.kind === "expands"
+                        ? longest(arm.subjectType, arm.targetSet)
+                        : longest(arm.viaType, arm.targetSet);
+                    len = far === null ? null : 1 + far;
                 }
-                readTimePaths.push({
-                    objectType: entityType,
-                    derivedRelation: rt.derivedRelation,
-                    sourceRelation: rt.derivedRelation,
-                    targetRelation,
-                    sourceTypes: [sourceType],
-                });
+                best = best === null || len === null ? null : Math.max(best, len);
             }
-            else {
-                const parts = rt.dotPath.split(".");
-                if (parts.length !== 2) {
-                    throw new Error(`Zbar Schema Error: readTimeRelation('${rt.derivedRelation}', '${rt.dotPath}') on '${entityType}' must be a single dot-path of the form 'source.target' (exactly one '.'). Got ${parts.length} segment(s).`);
-                }
-                const [sourceRelation, targetRelation] = parts;
-                const sourceTypes = getTargetEntityTypes(schema, entityType, sourceRelation);
-                readTimePaths.push({
-                    objectType: entityType,
-                    derivedRelation: rt.derivedRelation,
-                    sourceRelation,
-                    targetRelation,
-                    sourceTypes,
-                });
+        }
+        memo.set(key, best);
+        return best;
+    };
+    for (const [objectType, byName] of Object.entries(sets)) {
+        for (const set of Object.values(byName)) {
+            set.maxLineage = longest(objectType, set.name);
+            if (set.maxLineage !== null && set.maxLineage > maxDepth) {
+                throw new Error(`${ERR} the longest derivation of '${objectType}.${set.name}' uses ${set.maxLineage} facts, more than maxDepth (${maxDepth}). ` +
+                    `An acyclic chain must fit: raise maxDepth or shorten the chain.`);
             }
         }
     }
-    // Reject schemas whose read-time declarations form a cycle. A cyclic RT path
-    // at runtime would silently return false when the depth cap is hit — a
-    // denies-when-should-grant bug. Rejecting at schema load surfaces it early.
-    if (readTimePaths.length > 0) {
-        detectReadTimePathCycle(readTimePaths, schema);
-    }
-    return {
-        traversalRules: optimizedRules,
-        reverseEdges: Object.keys(reverseEdges).length > 0 ? reverseEdges : undefined,
-        readTimePaths: readTimePaths.length > 0 ? readTimePaths : undefined,
-    };
 }
 /**
- * 3-color DFS over the read-time-path graph. Nodes are `(entityType,
- * relation)` pairs; edges run from a derived relation to every relation the
- * target relation locally contains (mirroring runtime inheritance chaining).
- * Throws on the first cycle, with the full loop in the message.
+ * The subject types a fact written to `(objectType, relation)` may have:
+ * the facts arms (declared, or implied by an expansion) of the relation and
+ * of every relation it inherits. Empty for a permission or an unknown set.
  */
-function detectReadTimePathCycle(paths, schema) {
-    const edges = new Map();
-    const keyOf = (type, rel) => `${type}#${rel}`;
-    for (const rt of paths) {
-        const from = keyOf(rt.objectType, rt.derivedRelation);
-        const bucket = edges.get(from) ?? [];
-        for (const sourceType of rt.sourceTypes) {
-            for (const member of expandRelationTargets(schema, sourceType, [
-                rt.targetRelation,
-            ])) {
-                bucket.push(keyOf(sourceType, member));
-            }
+export function writableSubjectTypes(config, objectType, relation) {
+    if (!config.sets[objectType]?.[relation]?.writable)
+        return [];
+    const types = [];
+    for (const member of config.factRelations[objectType]?.[relation] ?? []) {
+        for (const arm of config.sets[objectType][member].arms) {
+            if (arm.kind === "facts" && !types.includes(arm.subjectType))
+                types.push(arm.subjectType);
         }
-        edges.set(from, bucket);
     }
-    const WHITE = 0;
-    const GRAY = 1;
-    const BLACK = 2;
-    const color = new Map();
-    const stack = [];
-    const visit = (node) => {
-        const c = color.get(node) ?? WHITE;
-        if (c === BLACK)
-            return;
-        if (c === GRAY) {
-            const loopStart = stack.indexOf(node);
-            const loop = [...stack.slice(loopStart), node].join(" → ");
-            throw new Error(`Read-time relation declarations form a cycle: ${loop}. Break the loop by removing or restructuring one of the readTimeRelation() declarations on this chain.`);
-        }
-        color.set(node, GRAY);
-        stack.push(node);
-        for (const next of edges.get(node) ?? [])
-            visit(next);
-        stack.pop();
-        color.set(node, BLACK);
-    };
-    for (const node of edges.keys())
-        visit(node);
+    return types;
 }
 //# sourceMappingURL=helpers.js.map

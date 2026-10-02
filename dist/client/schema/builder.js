@@ -1,120 +1,70 @@
+/**
+ * Mark an expands (`'group#devices'`) or walks (`'parent.admin'`) arm as
+ * materialized: the engine keeps its contribution as rows at write time
+ * instead of computing it at read time. Either way the arm means the same
+ * thing (CONTRACT.md §4); this only moves work from reads to writes.
+ */
+export function materialize(arm) {
+    return { materialize: arm };
+}
+/** A name is declared once per entity (relations and permissions share one namespace). */
+function declareOnce(def, name) {
+    if (name in def.relations || name in def.permissions) {
+        throw new Error(`Zbar Schema Error: '${name}' is declared twice on one entity. A set has one name.`);
+    }
+}
 export class EntityBuilder {
-    def = { relations: {}, permissions: {}, propertyValidators: {} };
+    def = {
+        relations: {},
+        permissions: {},
+        propertyValidators: {},
+    };
     /**
-     * When true, `.relation()` merges new targets into existing relation
-     * definitions instead of overwriting them. Set by `SchemaBuilder.extend()`.
+     * Declare a relation. Arms: `'system_user'` facts, `'admin'` inherits,
+     * `'group#viewer'` expands, `'parent.admin'` walks, `'~device#parent'`
+     * inverse, or `materialize(...)` of an expands/walks arm. With no arms the
+     * relation is an empty set.
      */
-    _mergeMode = false;
-    // Implementation
-    relation(name, ...targets) {
-        if (targets.length === 0) {
-            this.def.relations[name] = this.def.relations[name] ?? undefined;
-            return this;
-        }
-        const newValue = targets.length === 1 ? targets[0] : targets;
-        // In merge mode (used by .extend()), append new targets to any
-        // existing relation definition instead of replacing it.
-        const existing = this.def.relations[name];
-        if (this._mergeMode && existing != null) {
-            const existingArr = Array.isArray(existing) ? existing : [existing];
-            const newArr = Array.isArray(newValue) ? newValue : [newValue];
-            const merged = [...existingArr];
-            for (const t of newArr) {
-                const isDuplicate = merged.some((m) => typeof t === "string" && typeof m === "string" ? t === m
-                    : typeof t === "object" && typeof m === "object" && t !== null && m !== null
-                        ? JSON.stringify(t) === JSON.stringify(m)
-                        : false);
-                if (!isDuplicate) {
-                    merged.push(t);
-                }
-            }
-            this.def.relations[name] = merged.length === 1 ? merged[0] : merged;
-        }
-        else {
-            this.def.relations[name] = newValue;
-        }
+    relation(name, ...arms) {
+        declareOnce(this.def, name);
+        this.def.relations[name] = [...arms];
         return this;
     }
-    permission(name, ...targets) {
-        this.def.permissions[name] = targets;
+    /**
+     * Declare a permission: a set nothing is ever written to. Same arms as a
+     * relation except facts and `materialize` (CONTRACT.md §2.3).
+     */
+    permission(name, ...arms) {
+        declareOnce(this.def, name);
+        this.def.permissions[name] = [...arms];
         return this;
     }
     /**
      * Define typed properties for a relation using Convex validators.
      *
-     * Properties are stored on direct edges and returned by `.listDirect()`.
-     * They are validated at write-time by the client before being persisted.
+     * Properties are stored on facts and returned by `.listDirect()`. They are
+     * validated at write time by the client before being persisted.
      */
     properties(relation, validators) {
         this.def.propertyValidators[relation] = validators;
         return this;
     }
-    /**
-     * Declare a path that should be evaluated at **read time** rather than
-     * materialised at write time. Read-time paths produce **no** traversal
-     * rules; `can()` and `list()` evaluate them on demand using 2–3 indexed
-     * queries.
-     *
-     * Two path forms are supported:
-     *   1. Dot-path `'source.target'` — follow the local `source` relation to
-     *      an intermediate entity, then pick up its `target` relation.
-     *   2. Userset `'type#target'` — when a subject of `type` is assigned to
-     *      the derived relation, expand through that entity's `target` relation
-     *      at read time. The derived relation must declare `type` as a typed
-     *      target.
-     */
-    readTimeRelation(derivedRelation, ...paths) {
-        for (const path of paths) {
-            if (!path.includes(".") && !path.includes("#")) {
-                throw new Error(`Zbar Schema Error: readTimeRelation requires a dot-path ('source.target') or a userset ('type#target'). Got '${path}'.`);
-            }
-            if (path.includes(".") && path.includes("#")) {
-                throw new Error(`Zbar Schema Error: readTimeRelation path '${path}' mixes '.' and '#'; use exactly one.`);
-            }
-            this.def.readTimeRelations = this.def.readTimeRelations ?? [];
-            this.def.readTimeRelations.push({ derivedRelation, dotPath: path });
-        }
-        return this;
-    }
 }
 export class SchemaBuilder {
     _schema = { entities: {} };
-    entity(name, build) {
-        if (build) {
-            const e = build(new EntityBuilder());
-            this._schema.entities[name] = e.def;
-        }
-        else {
-            this._schema.entities[name] = { relations: {}, permissions: {} };
-        }
-        return this;
-    }
     /**
-     * Extend an already-defined entity with additional relations and/or
-     * permissions. Use this to add forward references that depend on entities
-     * defined later in the schema chain.
+     * Declare an entity. Without a callback it is a pure subject (an entity
+     * with no sets, e.g. `linked_recipient`). Entities may be declared in any
+     * order: names are resolved when the schema is compiled.
      */
-    extend(name, build) {
-        const existing = this._schema.entities[name];
-        if (!existing) {
-            throw new Error(`Zbar Schema Error: Cannot extend entity '${name}' — it has not been defined yet. Call .entity('${name}', ...) first.`);
-        }
-        const builder = new EntityBuilder();
-        builder.def = {
-            relations: { ...existing.relations },
-            permissions: { ...existing.permissions },
-            propertyValidators: { ...existing.propertyValidators },
-            ...(existing.readTimeRelations
-                ? { readTimeRelations: [...existing.readTimeRelations] }
-                : {}),
-        };
-        builder._mergeMode = true;
-        const result = build(builder);
-        this._schema.entities[name] = result.def;
+    entity(name, build) {
+        this._schema.entities[name] = build
+            ? build(new EntityBuilder()).def
+            : { relations: {}, permissions: {}, propertyValidators: {} };
         return this;
     }
+    /** The schema object. Names are resolved (and errors raised) when it is compiled. */
     build() {
-        // Reverse-edge wiring happens at runtime in `parseSchemaToGraphConfig`.
         return this._schema;
     }
 }

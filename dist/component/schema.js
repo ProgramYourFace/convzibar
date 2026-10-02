@@ -17,6 +17,10 @@ const legacyTenantId = v.optional(v.string());
 const legacyCondition = v.optional(v.string());
 const legacyConditionContext = v.optional(v.any());
 const schema = {
+    /**
+     * Facts (CONTRACT.md §1). Indexed from both ends so a first hop, an inverse
+     * arm and an object-side `listDirect` are each one exact range.
+     */
     relationships: defineTable({
         tenantId: legacyTenantId,
         subjectType: v.string(),
@@ -28,32 +32,80 @@ const schema = {
         conditionContext: legacyConditionContext,
         properties: v.optional(v.any()), // user-defined edge properties
     })
-        .index("by_object", ["objectType", "objectId"])
         .index("by_subject_relation_object", [
         "subjectType",
         "subjectId",
         "relation",
         "objectType",
         "objectId",
+    ])
+        .index("by_object_relation_subject", [
+        "objectType",
+        "objectId",
+        "relation",
+        "subjectType",
+        "subjectId",
     ]),
+    /**
+     * The mirror of every fact plus every materialized derivation
+     * (CONTRACT.md §5). `paths` is the row's lineages (at most `MAX_PATHS`,
+     * none a superset of another): a row exists iff it has a path. `rule` is
+     * the TraversalRule key that produced the path, or `'fact'` for a mirror,
+     * so `rebuild` can retire the paths of rules that no longer exist.
+     */
     effectiveRelationships: defineTable({
         tenantId: legacyTenantId,
         subjectKey: v.string(), // `${subjectType}:${subjectId}`
         relation: v.string(),
         objectKey: v.string(), // `${objectType}:${objectId}`
-        // Each path carries the `baseIds` (lineage tokens) of the edges that
-        // produced it. Removing a base edge surgically deletes only the paths
-        // containing that id — an O(N) cascade instead of a full recomputation.
         paths: v.array(v.object({
             baseIds: v.array(v.string()),
+            // Optional only for rows written before v2; the BFS always writes it.
+            rule: v.optional(v.string()),
             conditions: v.optional(v.array(v.object({
                 condition: v.string(),
                 conditionContext: v.optional(v.any()),
             }))), // @deprecated v1 leftover
         })),
     })
-        .index("by_subject_relation_object", ["subjectKey", "relation", "objectKey"])
-        .index("by_object_relation_subject", ["objectKey", "relation", "subjectKey"]),
+        .index("by_subject_relation_object", [
+        "subjectKey",
+        "relation",
+        "objectKey",
+    ])
+        .index("by_object_relation_subject", [
+        "objectKey",
+        "relation",
+        "subjectKey",
+    ]),
+    /**
+     * Invariant L (EXPANSION.md §1.4): exactly one row per (fact f, effective
+     * row, stored path p) with f ∈ p.baseIds, written and deleted in the same
+     * transaction as the path. `path` is `pathId(p)` (paths.ts). Removal of f is
+     * one range over `by_fact` (CONTRACT §5.5); `by_row` finds the lineage rows
+     * of one path when it is dropped.
+     */
+    lineage: defineTable({
+        factId: v.string(),
+        rowId: v.id("effectiveRelationships"),
+        path: v.string(),
+    })
+        .index("by_fact", ["factId", "rowId", "path"])
+        .index("by_row", ["rowId", "path", "factId"]),
+    /**
+     * A continuation that gave up (CONTRACT.md §5.7), a derivation past
+     * `maxDepth` (§5.2), or a path a full row could not take (`paths`, §5.2).
+     * For `failed`/`canceled`, `cursor` is the exact continuation payload, so
+     * `resumeExpansion` re-enqueues it unchanged; `depth` and `paths` are
+     * repaired by `rebuild`.
+     */
+    expansionFailures: defineTable({
+        cursor: v.any(),
+        reason: v.union(v.literal("failed"), v.literal("canceled"), v.literal("depth"), v.literal("paths")),
+        error: v.string(),
+        attempts: v.number(),
+        createdAt: v.number(),
+    }).index("by_createdAt", ["createdAt"]),
     // @deprecated v1 leftover, kept only so deployments with historical audit
     // rows pass schema validation. The engine never writes to it. Clear the
     // table and delete this block whenever convenient.
@@ -78,6 +130,14 @@ const schema = {
         hash: v.string(),
         config: v.any(), // GraphConfig
     }).index("by_hash", ["hash"]),
+    /**
+     * At most one row: the hash of the ACTIVE config (EXPANSION.md §1.1,
+     * Lemma Q). A write under another hash makes it active and enqueues a
+     * `rebuild` under it; add and rebuild cursors of any other hash are dropped.
+     */
+    activeConfig: defineTable({
+        hash: v.string(),
+    }),
 };
 // ============================================================================
 // Test-Time Only Schema

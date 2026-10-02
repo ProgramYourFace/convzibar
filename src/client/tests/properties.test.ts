@@ -1,16 +1,10 @@
+import { zbarEngineTest } from "../../test";
 import { expect, test, describe } from "vitest";
-import { Zbar, createZbarSchema } from "../index.js";
-import { convexTest } from "convex-test";
-import schema from "../../component/schema.js";
-import { api } from "../../component/_generated/api.js";
-import { register as registerWorkpool } from "@convex-dev/workpool/test";
+import { Zbar, createZbarSchema } from "../index";
+import { api } from "../../component/_generated/api";
 import { v } from "convex/values";
 
-const setup = () => {
-  const t = convexTest(schema, import.meta.glob("../../component/**/*.ts"));
-  registerWorkpool(t, "workpool");
-  return t;
-};
+const setup = zbarEngineTest;
 
 const mkCtx = (t: any) =>
   ({
@@ -52,11 +46,7 @@ const propsSchema = createZbarSchema()
   )
   .build();
 
-const mkZbar = () =>
-  new Zbar(api, {
-    schema: propsSchema,
-    asyncWrites: false,
-  });
+const mkZbar = () => new Zbar(api, { schema: propsSchema });
 
 // ============================================================================
 // Tests
@@ -86,22 +76,6 @@ describe("Edge Properties", () => {
     expect(adminRow.properties).toEqual({ role_title: "CTO", priority: 1 });
   });
 
-  test("addRelation without properties stores undefined", async () => {
-    const t = setup();
-    const ctx = mkCtx(t);
-    const zbar = mkZbar();
-
-    const user = { type: "user" as const, id: "u1" };
-    const org = { type: "org" as const, id: "org1" };
-
-    await zbar.addRelation(ctx, user, "owner", org);
-
-    const rows = await t.run(async (innerCtx: any) =>
-      innerCtx.db.query("relationships").collect(),
-    );
-    expect(rows[0].properties).toBeUndefined();
-  });
-
   test("listDirect returns properties on edges", async () => {
     const t = setup();
     const ctx = mkCtx(t);
@@ -118,10 +92,7 @@ describe("Edge Properties", () => {
       properties: { read_only: true, expires_at: "2025-12-31" },
     });
 
-    const results = await zbar
-      .listDirect()
-      .object(org)
-      .collect(ctx);
+    const results = await zbar.listDirect().object(org).collect(ctx);
 
     const aliceRel = results.find(
       (r) => r.subject.id === "alice" && r.relation === "admin",
@@ -161,28 +132,6 @@ describe("Edge Properties", () => {
     expect(admins[0].properties).toEqual({ role_title: "Admin", priority: 5 });
   });
 
-  test("listDirect with subject+object returns properties", async () => {
-    const t = setup();
-    const ctx = mkCtx(t);
-    const zbar = mkZbar();
-
-    const user = { type: "user" as const, id: "u1" };
-    const org = { type: "org" as const, id: "org1" };
-
-    await zbar.addRelation(ctx, user, "admin", org, {
-      properties: { role_title: "Lead", priority: 10 },
-    });
-
-    const rels = await zbar
-      .listDirect()
-      .object(org)
-      .subject(user)
-      .collect(ctx);
-
-    expect(rels).toHaveLength(1);
-    expect(rels[0].properties).toEqual({ role_title: "Lead", priority: 10 });
-  });
-
   test("properties with optional fields can omit optional values", async () => {
     const t = setup();
     const ctx = mkCtx(t);
@@ -197,10 +146,7 @@ describe("Edge Properties", () => {
       properties: { read_only: false },
     });
 
-    const rels = await zbar
-      .listDirect()
-      .object(org)
-      .collect(ctx);
+    const rels = await zbar.listDirect().object(org).collect(ctx);
 
     expect(rels[0].properties).toEqual({ read_only: false });
   });
@@ -257,34 +203,6 @@ describe("Edge Properties", () => {
     ).rejects.toThrow(/No properties defined for relation 'owner'/);
   });
 
-  test("updateRelation preserves properties on the new relation", async () => {
-    const t = setup();
-    const ctx = mkCtx(t);
-    const zbar = mkZbar();
-
-    const user = { type: "user" as const, id: "u1" };
-    const org = { type: "org" as const, id: "org1" };
-
-    await zbar.addRelation(ctx, user, "viewer", org, {
-      properties: { read_only: true },
-    });
-
-    // Update to admin with new properties
-    await zbar.updateRelation(ctx, user, "viewer", "admin", org, {
-      properties: { role_title: "Promoted", priority: 3 },
-    });
-
-    const rels = await zbar
-      .listDirect()
-      .object(org)
-      .subject(user)
-      .collect(ctx);
-
-    expect(rels).toHaveLength(1);
-    expect(rels[0].relation).toBe("admin");
-    expect(rels[0].properties).toEqual({ role_title: "Promoted", priority: 3 });
-  });
-
   test("setRelation stores properties on the new relation", async () => {
     const t = setup();
     const ctx = mkCtx(t);
@@ -303,33 +221,11 @@ describe("Edge Properties", () => {
     // setRelation replaces all with owner (which has no properties)
     await zbar.setRelation(ctx, user, "owner", org);
 
-    const rels = await zbar
-      .listDirect()
-      .object(org)
-      .subject(user)
-      .collect(ctx);
+    const rels = await zbar.listDirect().object(org).subject(user).collect(ctx);
 
     expect(rels).toHaveLength(1);
     expect(rels[0].relation).toBe("owner");
     expect(rels[0].properties).toBeUndefined();
-  });
-
-  test("permission checks still work with properties on edges", async () => {
-    const t = setup();
-    const ctx = mkCtx(t);
-    const zbar = mkZbar();
-
-    const user = { type: "user" as const, id: "u1" };
-    const org = { type: "org" as const, id: "org1" };
-
-    await zbar.addRelation(ctx, user, "admin", org, {
-      properties: { role_title: "Admin", priority: 1 },
-    });
-
-    // admin can edit_settings
-    expect(await zbar.can(ctx, user, "edit_settings", org)).toBe(true);
-    // admin inherits viewer, so can view_dashboard
-    expect(await zbar.can(ctx, user, "view_dashboard", org)).toBe(true);
   });
 
   test("properties survive through graph expansion (project editor via org admin)", async () => {
@@ -361,28 +257,6 @@ describe("Edge Properties", () => {
     expect(orgRels[0].properties).toEqual({ role_title: "CTO", priority: 1 });
   });
 
-  test("listDirect().map() receives properties", async () => {
-    const t = setup();
-    const ctx = mkCtx(t);
-    const zbar = mkZbar();
-
-    const user = { type: "user" as const, id: "u1" };
-    const org = { type: "org" as const, id: "org1" };
-
-    await zbar.addRelation(ctx, user, "admin", org, {
-      properties: { role_title: "CTO", priority: 1 },
-    });
-
-    const titles = await zbar
-      .listDirect()
-      .object(org)
-      .relation("admin")
-      .map((r) => (r.properties as any)?.role_title)
-      .collect(ctx);
-
-    expect(titles).toEqual(["CTO"]);
-  });
-
   test("edges without properties return undefined in listDirect results", async () => {
     const t = setup();
     const ctx = mkCtx(t);
@@ -394,10 +268,7 @@ describe("Edge Properties", () => {
     // owner has no properties defined
     await zbar.addRelation(ctx, user, "owner", org);
 
-    const rels = await zbar
-      .listDirect()
-      .object(org)
-      .collect(ctx);
+    const rels = await zbar.listDirect().object(org).collect(ctx);
 
     expect(rels[0].properties).toBeUndefined();
   });

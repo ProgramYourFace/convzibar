@@ -1,85 +1,73 @@
 /**
- * Shared helpers for walking `SchemaRelation` definitions.
+ * Arm parsing for the compiler (`helpers.ts`).
  *
- * The schema stores relation targets as a heterogeneous union (bare strings,
- * typed objects, userset strings, dot-paths, or arrays of the above). Multiple
- * modules need to discriminate and walk those shapes — keeping the
- * string-parsing rules in one place makes sure they stay consistent.
+ * The schema stores arms verbatim (strings and `materialize()` wrappers).
+ * Classifying them in one place keeps the grammar of CONTRACT.md §2 in one
+ * place: syntax decides walks / expands / inverse; a bare name is resolved
+ * against the entity's sets first and the entity types second.
  */
-/**
- * A single classified target of a relation. Strings are parsed against the
- * caller-provided context (`localRelations`, `entities`) so the discriminant
- * captures the string's *meaning*, not just its syntax.
- */
-export type RelationTargetShape = 
-/** `{ type: X }` or `{ type: X, reverse: Y }` — a typed subject reference. */
+type RelationTargetShape = 
+/** A bare name that is a set (relation or permission) on the same entity. */
 {
-    kind: "typed";
-    entityType: string;
-    reverse?: string;
+    kind: "inherits";
+    set: string;
+    raw: string;
+    materialized: boolean;
 }
-/** `"source.target"` — a read-time dot-path. */
+/** A bare name that is an entity type. */
  | {
-    kind: "dotPath";
-    source: string;
-    target: string;
+    kind: "facts";
+    subjectType: string;
+    raw: string;
+    materialized: boolean;
 }
-/** `"type#relation"` — a userset rewrite. */
+/** `'type#set'`. */
  | {
-    kind: "userset";
-    entityType: string;
-    targetRelation: string;
+    kind: "expands";
+    subjectType: string;
+    targetSet: string;
+    raw: string;
+    materialized: boolean;
 }
-/** A bare string that resolves to a local relation on the current entity. */
+/** `'via.set'`. */
  | {
-    kind: "localRef";
+    kind: "walks";
+    viaRelation: string;
+    targetSet: string;
+    raw: string;
+    materialized: boolean;
+}
+/** `'~type#relation'`. */
+ | {
+    kind: "inverse";
+    subjectType: string;
     relation: string;
+    raw: string;
+    materialized: boolean;
 }
-/** A bare string that resolves to an entity type in the schema. */
- | {
-    kind: "entity";
-    entityType: string;
-}
-/** A bare string that matches neither a local relation nor a declared entity. */
+/** A bare name that is neither a set here nor an entity type. */
  | {
     kind: "unknown";
     raw: string;
+    materialized: boolean;
+}
+/** Not one of the five forms (two operators, empty segments, three segments...). */
+ | {
+    kind: "invalid";
+    raw: string;
+    materialized: boolean;
+    reason: string;
 };
-export interface ClassificationContext {
-    /** Relations declared on the entity that *owns* the def being classified. */
-    localRelations: Record<string, unknown> | undefined;
-    /** All declared entity types — passed so bare-string entity refs resolve. */
-    entities: Record<string, unknown>;
+interface ClassificationContext {
+    /** Every set (relation AND permission) declared on the entity that owns the arm, but the set itself. */
+    localSets: ReadonlySet<string>;
+    /** All declared entity types. */
+    entities: ReadonlySet<string>;
 }
 /**
- * Classify a string reference found inside a relation def. The kind is
- * determined by syntax (dot-path, userset) first, then by lookup
- * (`localRelations` then `entities`), falling back to `unknown`.
+ * Classify every arm of one set (`undefined`: a set with no arms). Anything
+ * that is neither a string nor `{ materialize: string }` is invalid.
  */
-export declare function classifyStringRef(raw: string, ctx: ClassificationContext): RelationTargetShape;
-/**
- * Iterate the targets of a relation def, yielding one tagged shape per
- * entry. Handles the array-or-single wrapping and the string / typed
- * dispatch — callers match on `kind` instead of re-parsing strings.
- */
-export declare function iterateRelationTargets(relDef: unknown, ctx: ClassificationContext): Generator<RelationTargetShape>;
-export interface ExpandOptions {
-    /**
-     * When true, the walker recurses ONLY into strings that resolve to a
-     * local relation on the object entity. When false (default), any string
-     * without a `.` is treated as a recurrable ref — matching the historical
-     * client behaviour where userset strings would be added to the result set
-     * (harmless but noisy; no effective rows match).
-     */
-    strictLocalRefs?: boolean;
-}
-/**
- * Expand a seed set of relation names into every relation name they
- * transitively contain via local userset rewrites on `objectType`.
- */
-export declare function expandRelationTargets(schema: {
-    entities: Record<string, {
-        relations?: Record<string, unknown>;
-    } | undefined>;
-}, objectType: string, seed: ReadonlyArray<string>, options?: ExpandOptions): string[];
+export declare function iterateRelationTargets(arms: unknown, ctx: ClassificationContext): Generator<RelationTargetShape>;
+export {};
 //# sourceMappingURL=relation-def.d.ts.map

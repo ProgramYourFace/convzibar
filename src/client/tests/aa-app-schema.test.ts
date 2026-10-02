@@ -1,431 +1,301 @@
-import { expect, test, describe } from "vitest";
-import { convexTest } from "convex-test";
-import { Zbar, createZbarSchema } from "../index.js";
-import { v } from "convex/values";
-import schema from "../../component/schema.js";
-import { api } from "../../component/_generated/api.js";
-import { register as registerWorkpool } from "@convex-dev/workpool/test";
+import { zbarEngineTest } from "../../test";
+import { api } from "../../component/_generated/api";
+import { expect, test } from "vitest";
+import { schema } from "./fixtures/aa-app-schema";
+import { Zbar } from "../index";
 
 // ============================================================================
-// Downstream-consumer parity: aa-app's production schema, verbatim.
-//
-// aa-app (the primary consumer of this package) defines the schema below in
-// `schemas/zbar.ts` and drives it with a fixed set of call patterns:
-// `can` / `getPermissions` / `addRelation` / `removeRelation` / `setRelation`
-// / `deleteEntity`, plus `.list()` (with `.via()`) and `.listDirect()`
-// (with `.map()` and edge `properties`). This file pins those exact paths so
-// engine refactors can't silently break the consumer.
-//
-// Keep in sync with aa-app `schemas/zbar.ts` when its model changes.
+// The app schema (schemas/zbar.ts) answers a table of EXPECTED reads. Facts
+// are seeded directly with their mirror rows, and the materialized `source`
+// rows as a caught-up BFS holds them, so this pins the READ side on its own:
+// parity.test.ts proves the two engines agree (not what they answer), and
+// convex/lib/zbarAccess.test.ts pins the access policy; this pins the rest —
+// recipients through `system#member` and `group#seats`, inverse lists,
+// `listDirect` flipping an inverse set, a materialized row read with no BFS.
 // ============================================================================
 
-const aaSchema = createZbarSchema()
-  .entity("user", (e) => e)
+type Node = { type: string; id: string };
+const n = (type: string, id: string): Node => ({ type, id });
 
-  .entity("system", (e) =>
-    e
-      .relation("owner")
-      .relation("admin", "owner")
-      .relation("viewer", "admin")
+const s1 = n("system", "s1");
+const [gA, gB] = [n("group", "gA"), n("group", "gB")];
+const [d1, d2, d3] = ["d1", "d2", "d3"].map((id) => n("device", id));
+const [rule1, rule2] = [
+  n("notification_rule", "rule1"),
+  n("notification_rule", "rule2"),
+];
+const db1 = n("dashboard", "db1");
+const lr = n("linked_recipient", "lr1");
+// Seats: ow owns s1, ad admins it, vw views it and admins gA, rm is a restricted member of gB.
+const [ow, ad, vw, rm] = ["ow", "ad", "vw", "rm"].map((id) =>
+  n("system_user", id),
+);
 
-      .relation("has_group")
-      .relation("has_rule")
-      .relation("has_geofence")
-      .relation("has_system_user")
+const facts: [Node, string, Node, unknown?][] = [
+  ...[ow, ad, vw, rm].flatMap((seat) => [
+    [s1, "parent", seat] as [Node, string, Node],
+    [seat, "self", seat] as [Node, string, Node],
+  ]),
+  [ow, "owner", s1],
+  [ad, "admin", s1],
+  [vw, "viewer", s1],
+  [s1, "parent", gA],
+  [s1, "parent", gB],
+  [vw, "admin", gA],
+  [rm, "viewer", gB],
+  [s1, "parent", d1],
+  [s1, "parent", d2],
+  [s1, "parent", d3],
+  [gA, "admin", d1], // d1: gA at admin, gB at operator
+  [gB, "operator", d1],
+  [rm, "viewer", d2], // d2: a direct seat grant
+  [gB, "viewer", rm], // gB contains rm's seat (group.seats ⊇ ~system_user#viewer)
+  [s1, "parent", db1],
+  [gA, "viewer", db1],
+  [s1, "parent", rule1],
+  [s1, "parent", rule2],
+  [gA, "source", rule1],
+  [s1, "recipient", rule1],
+  [d2, "source", rule2],
+  [rm, "recipient", rule2, { push: true, email: false }],
+  [lr, "recipient", rule2],
+];
+// The two materialized `source` arms, caught up: gA's devices are {d1}.
+const derived: [Node, string, Node][] = [[d1, "source", rule1]];
 
-      .relation("user_member", "viewer")
-      .relation("device_member")
-
-      .permission("view", "viewer")
-      .permission("view_as_member", "user_member")
-      .permission("manage_resources", "admin")
-      .permission("manage_members", "admin")
-      .permission("manage_owners", "owner")
-      .permission("manage", "owner")
-      .permission("configure_as_recipient", "admin"),
-  )
-
-  .entity("group", (e) =>
-    e
-      .relation("parent", { type: "system", reverse: "has_group" })
-      .relation("admin")
-      .relation("viewer", "admin")
-      .readTimeRelation("admin", "parent.admin")
-      .readTimeRelation("viewer", "parent.viewer")
-      .relation("user_member", "viewer")
-
-      .relation("admin_device")
-      .relation("viewer_device")
-      .relation("admin_geofence")
-      .relation("viewer_geofence")
-      .relation("admin_notification_rule")
-      .relation("viewer_notification_rule")
-      .relation("admin_system_user")
-      .relation("viewer_system_user")
-
-      .relation("device_member", "admin_device", "viewer_device")
-      .relation("system_user_visible", "viewer_system_user")
-
-      .permission("view", "viewer")
-      .permission("manage", "admin")
-      .permission("manage_members", "admin")
-      .permission("configure_as_recipient", "admin"),
-  )
-
-  .entity("device", (e) =>
-    e
-      .relation("parent", { type: "system", reverse: "device_member" })
-      .relation("admin", { type: "group", reverse: "admin_device" })
-      .relation("viewer", "admin", { type: "group", reverse: "viewer_device" })
-      .readTimeRelation("admin", "parent.admin", "group#admin")
-      .readTimeRelation("viewer", "parent.viewer", "group#viewer")
-      .relation("user_member", "viewer")
-      .permission("view", "viewer")
-      .permission("manage", "admin")
-      .permission("manage_members", "admin"),
-  )
-
-  .entity("geofence", (e) =>
-    e
-      .relation("parent", { type: "system", reverse: "has_geofence" })
-      .relation("admin", { type: "group", reverse: "admin_geofence" })
-      .relation("viewer", "admin", { type: "group", reverse: "viewer_geofence" })
-      .readTimeRelation("admin", "parent.admin", "group#admin")
-      .readTimeRelation("viewer", "parent.viewer", "group#viewer")
-      .permission("view", "viewer")
-      .permission("manage", "admin"),
-  )
-
-  .entity("system_user", (e) =>
-    e
-      .relation("parent", { type: "system", reverse: "has_system_user" })
-      .relation("identity", "user")
-      .relation("admin", { type: "group", reverse: "admin_system_user" })
-      .relation("viewer", "admin", {
-        type: "group",
-        reverse: "viewer_system_user",
-      })
-      .readTimeRelation("admin", "parent.admin", "group#admin")
-      .readTimeRelation("viewer", "parent.viewer", "group#viewer")
-      .permission("view", "viewer")
-      .permission("manage", "admin")
-      .permission("configure_as_recipient", "viewer"),
-  )
-
-  .entity("notification_rule", (e) =>
-    e
-      .relation("parent", { type: "system", reverse: "has_rule" })
-      .relation(
-        "source",
-        "system",
-        "device",
-        "group",
-        "group#device_member",
-        "system#device_member",
-      )
-      .relation(
-        "recipient",
-        "system",
-        "system_user",
-        "group",
-        "group#system_user_visible",
-      )
-      .properties("recipient", {
-        email: v.optional(v.boolean()),
-        sms: v.optional(v.boolean()),
-        push: v.optional(v.boolean()),
-      })
-      .relation("admin", { type: "group", reverse: "admin_notification_rule" })
-      .readTimeRelation("admin", "parent.admin", "group#admin")
-      .relation("viewer", "admin", {
-        type: "group",
-        reverse: "viewer_notification_rule",
-      })
-      .readTimeRelation("viewer", "parent.viewer", "group#viewer")
-      .permission("view", "viewer")
-      .permission("manage", "admin"),
-  )
-
-  .extend("system", (e) =>
-    e
-      .relation("owner", "system_user", "system_user#identity")
-      .relation("admin", "system_user", "system_user#identity")
-      .relation("viewer", "system_user", "system_user#identity")
-      .readTimeRelation("user_member", "has_group.user_member"),
-  )
-  .extend("group", (e) =>
-    e
-      .relation("admin", "system_user", "system_user#identity")
-      .relation("viewer", "system_user", "system_user#identity"),
-  )
-  .build();
-
-const setup = () => {
-  const t = convexTest(schema, import.meta.glob("../../component/**/*.ts"));
-  registerWorkpool(t, "workpool");
-  return t;
-};
-
-const mkCtx = (t: any) =>
-  ({
+async function setup() {
+  const t = zbarEngineTest();
+  const ctx = {
     runQuery: t.query.bind(t),
     runMutation: t.mutation.bind(t),
-  }) as any;
-
-// Mirror aa-app's client options (convex/zbar.ts): synchronous writes so a
-// freshly added relation is queryable in the same mutation, depth 10.
-const mkZbar = () =>
-  new Zbar(api, { schema: aaSchema, asyncWrites: false, maxWriteDepth: 10 });
-
-type EntityName = keyof (typeof aaSchema)["entities"] & string;
-const ref = <T extends EntityName>(type: T, id: string) => ({ type, id });
-
-// Fixture mirroring aa-app provisioning (convex/service.ts + containment.ts):
-//   system s1
-//   ├── su_owner  (identity u_owner)  — owner of s1
-//   ├── su_member (identity u_member) — viewer of s1
-//   ├── group g1  (su_ga admin; identity u_ga)
-//   ├── device d1 (admin-tier containment in g1)
-//   ├── device d2 (viewer-tier containment in g1)
-//   └── rule nr1  (source: s1, recipient: su_member with channel properties)
-async function provision(zbar: ReturnType<typeof mkZbar>, ctx: any) {
-  const s1 = ref("system", "s1");
-  const g1 = ref("group", "g1");
-  const d1 = ref("device", "d1");
-  const d2 = ref("device", "d2");
-  const nr1 = ref("notification_rule", "nr1");
-  const suOwner = ref("system_user", "su_owner");
-  const suGa = ref("system_user", "su_ga");
-  const suMember = ref("system_user", "su_member");
-  const uOwner = ref("user", "u_owner");
-  const uGa = ref("user", "u_ga");
-  const uMember = ref("user", "u_member");
-
-  // Seats and identities.
-  for (const [su, u] of [
-    [suOwner, uOwner],
-    [suGa, uGa],
-    [suMember, uMember],
-  ] as const) {
-    await zbar.addRelation(ctx, s1, "parent", su);
-    await zbar.addRelation(ctx, u, "identity", su);
-  }
-  await zbar.addRelation(ctx, suOwner, "owner", s1);
-  await zbar.addRelation(ctx, suMember, "viewer", s1);
-
-  // Group + containment tiers.
-  await zbar.addRelation(ctx, s1, "parent", g1);
-  await zbar.addRelation(ctx, suGa, "admin", g1);
-  await zbar.addRelation(ctx, s1, "parent", d1);
-  await zbar.addRelation(ctx, s1, "parent", d2);
-  await zbar.addRelation(ctx, g1, "admin", d1);
-  await zbar.addRelation(ctx, g1, "viewer", d2);
-
-  // Notification rule wiring.
-  await zbar.addRelation(ctx, s1, "parent", nr1);
-  await zbar.addRelation(ctx, s1, "source", nr1);
-  await zbar.addRelation(ctx, suMember, "recipient", nr1, {
-    properties: { email: true, push: true },
+  } as any;
+  const zbar: any = new Zbar(api, { schema });
+  await t.run(async (c: any) => {
+    const ids: string[] = [];
+    for (const [s, relation, o, properties] of facts) {
+      const id = await c.db.insert("relationships", {
+        subjectType: s.type,
+        subjectId: s.id,
+        relation,
+        objectType: o.type,
+        objectId: o.id,
+        ...(properties === undefined ? {} : { properties }),
+      });
+      ids.push(id);
+      await c.db.insert("effectiveRelationships", {
+        subjectKey: `${s.type}:${s.id}`,
+        relation,
+        objectKey: `${o.type}:${o.id}`,
+        paths: [{ baseIds: [id], rule: "fact" }],
+      });
+    }
+    for (const [s, relation, o] of derived) {
+      await c.db.insert("effectiveRelationships", {
+        subjectKey: `${s.type}:${s.id}`,
+        relation,
+        objectKey: `${o.type}:${o.id}`,
+        paths: [{ baseIds: ids, rule: "test:materialized" }],
+      });
+    }
   });
-
-  return { s1, g1, d1, d2, nr1, suOwner, suGa, suMember, uOwner, uGa, uMember };
+  return { ctx, zbar };
 }
 
-describe("aa-app schema parity", () => {
-  test("ownership chain through system_user#identity grants full system permissions", async () => {
-    const t = setup();
-    const ctx = mkCtx(t);
-    const zbar = mkZbar();
-    const f = await provision(zbar, ctx);
+const ids = (rows: any[], key: "objectId" | "subjectId") =>
+  rows.map((r) => r[key]).sort();
 
-    expect(await zbar.can(ctx, f.uOwner, "manage", f.s1)).toBe(true);
-    expect(await zbar.can(ctx, f.uOwner, "manage_owners", f.s1)).toBe(true);
-    expect(await zbar.can(ctx, f.uMember, "view", f.s1)).toBe(true);
-    expect(await zbar.can(ctx, f.uMember, "manage", f.s1)).toBe(false);
+test("(h) the proposal §2 app schema answers the expected checks", async () => {
+  const { ctx, zbar } = await setup();
 
-    const perms = await zbar.getPermissions(ctx, f.uOwner, f.s1);
-    expect(new Set(perms)).toEqual(
-      new Set([
-        "view",
-        "view_as_member",
-        "manage_resources",
-        "manage_members",
-        "manage_owners",
-        "manage",
-        "configure_as_recipient",
-      ]),
+  const checks: [Node, string, Node, boolean][] = [
+    [ow, "manage", s1, true],
+    [ad, "manage", s1, false],
+    [ad, "manage_resources", s1, true],
+    [rm, "view", s1, false],
+    [rm, "view_as_member", s1, true], // member ⊇ ~system_user#parent: no tuple
+    [vw, "view", d3, true], // parent.viewer
+    [vw, "manage", d3, false],
+    [vw, "manage", d1, true], // gA admin of d1, vw admin of gA (group#admin)
+    [rm, "operate", d1, true], // gB at operator, rm a member of gB (group#viewer)
+    [rm, "manage", d1, false],
+    [rm, "view", d2, true],
+    [rm, "view", d3, false],
+    [vw, "view", gB, true], // system viewers see every group, through the permission …
+    [vw, "manage", gB, false],
+    [ad, "manage", gB, true],
+    [rm, "view", vw, false],
+    [rm, "view", rm, true], // self
+    [ad, "manage", rm, true], // parent.admin on the seat
+    [vw, "view", db1, true],
+    [rm, "view", db1, false],
+    [vw, "manage", db1, false], // authoring is system-admin only
+    [ad, "manage", db1, true],
+  ];
+  for (const [s, p, o, want] of checks) {
+    expect(await zbar.can(ctx, s, p, o), `${s.id} ${p} ${o.type}:${o.id}`).toBe(
+      want,
     );
-    expect(await zbar.getPermissions(ctx, f.uMember, f.s1)).toEqual(
-      expect.arrayContaining(["view", "view_as_member"]),
-    );
-  });
+  }
 
-  test("group admin/viewer resolve via parent.* read-time paths", async () => {
-    const t = setup();
-    const ctx = mkCtx(t);
-    const zbar = mkZbar();
-    const f = await provision(zbar, ctx);
+  // … but are not its members: `group#viewer` elsewhere expands to members only.
+  expect(await zbar.hasRelationship(ctx, vw, "viewer", gB)).toBe(false);
+  expect(await zbar.getPermissions(ctx, vw, gA)).toEqual([
+    "view",
+    "manage",
+    "manage_members",
+    "configure_as_recipient",
+  ]);
+  expect(await zbar.getPermissions(ctx, rm, d1)).toEqual(["view", "operate"]);
 
-    // System owner manages the group through the parent.admin RT path.
-    expect(await zbar.can(ctx, f.uOwner, "manage", f.g1)).toBe(true);
-    // Group admin manages the group directly, but not the system.
-    expect(await zbar.can(ctx, f.uGa, "manage", f.g1)).toBe(true);
-    expect(await zbar.can(ctx, f.uGa, "manage", f.s1)).toBe(false);
-    expect(await zbar.can(ctx, f.uGa, "view", f.s1)).toBe(false);
-    // System viewer sees the group through parent.viewer RT.
-    expect(await zbar.can(ctx, f.uMember, "view", f.g1)).toBe(true);
-    expect(await zbar.can(ctx, f.uMember, "manage", f.g1)).toBe(false);
-  });
+  // Inverse collections: one facts range each, no stored reverse rows.
+  const list = zbar.list();
+  expect(
+    ids(
+      await list.object(s1).relation("devices").subject("device").collect(ctx),
+      "subjectId",
+    ),
+  ).toEqual(["d1", "d2", "d3"]);
+  expect(
+    ids(
+      await zbar
+        .list()
+        .object(gA)
+        .relation("devices")
+        .subject("device")
+        .collect(ctx),
+      "subjectId",
+    ),
+  ).toEqual(["d1"]);
+  expect(
+    ids(
+      await zbar
+        .list()
+        .object(gB)
+        .relation("seats")
+        .subject("system_user")
+        .collect(ctx),
+      "subjectId",
+    ),
+  ).toEqual(["rm"]);
+  expect(
+    ids(
+      await zbar
+        .list()
+        .object(s1)
+        .relation("member")
+        .subject("system_user")
+        .collect(ctx),
+      "subjectId",
+    ),
+  ).toEqual(["ad", "ow", "rm", "vw"]);
 
-  test("device containment: group#admin / group#viewer read-time usersets", async () => {
-    const t = setup();
-    const ctx = mkCtx(t);
-    const zbar = mkZbar();
-    const f = await provision(zbar, ctx);
+  // The hot materialized relation is one range; the cold computed one expands at read time.
+  expect(
+    ids(
+      await zbar
+        .list()
+        .object("notification_rule")
+        .relation("source")
+        .subject(d1)
+        .collect(ctx),
+      "objectId",
+    ),
+  ).toEqual(["rule1"]);
+  expect(
+    ids(
+      await zbar
+        .list()
+        .object(rule1)
+        .relation("recipient")
+        .subject("system_user")
+        .collect(ctx),
+      "subjectId",
+    ),
+  ).toEqual(["ad", "ow", "rm", "vw"]);
+  expect(
+    ids(
+      await zbar
+        .list()
+        .object(rule2)
+        .relation("recipient")
+        .subject("system_user")
+        .collect(ctx),
+      "subjectId",
+    ),
+  ).toEqual(["rm"]);
 
-    // Admin-tier containment: group admin manages d1.
-    expect(await zbar.can(ctx, f.uGa, "manage", f.d1)).toBe(true);
-    // Viewer-tier containment: group admin only views d2.
-    expect(await zbar.can(ctx, f.uGa, "manage", f.d2)).toBe(false);
-    expect(await zbar.can(ctx, f.uGa, "view", f.d2)).toBe(true);
-    // System-level access flows through parent.* RT paths.
-    expect(await zbar.can(ctx, f.uOwner, "manage", f.d1)).toBe(true);
-    expect(await zbar.can(ctx, f.uMember, "view", f.d1)).toBe(true);
-    expect(await zbar.can(ctx, f.uMember, "manage", f.d1)).toBe(false);
-    // Strangers see nothing.
-    expect(await zbar.can(ctx, ref("user", "outsider"), "view", f.d1)).toBe(false);
+  // Lists of reach.
+  expect(
+    ids(
+      await zbar
+        .list()
+        .object("device")
+        .permission("view")
+        .subject(rm)
+        .collect(ctx),
+      "objectId",
+    ),
+  ).toEqual(["d1", "d2"]);
+  expect(
+    ids(
+      await zbar
+        .list()
+        .object("device")
+        .permission("view")
+        .subject(vw)
+        .collect(ctx),
+      "objectId",
+    ),
+  ).toEqual(["d1", "d2", "d3"]);
+  expect(
+    ids(
+      await zbar
+        .list()
+        .object(d1)
+        .permission("operate")
+        .subject("system_user")
+        .collect(ctx),
+      "subjectId",
+    ),
+  ).toEqual(["ad", "ow", "rm", "vw"]);
+  expect(
+    ids(
+      await zbar
+        .list()
+        .object("device")
+        .permission("view")
+        .subject(rm)
+        .via(s1)
+        .collect(ctx),
+      "objectId",
+    ),
+  ).toEqual(["d1", "d2"]);
 
-    expect(
-      new Set(await zbar.getPermissions(ctx, f.uGa, f.d1)),
-    ).toEqual(new Set(["view", "manage", "manage_members"]));
-  });
-
-  test(".list() with permission + .via() system gate (scopedList pattern)", async () => {
-    const t = setup();
-    const ctx = mkCtx(t);
-    const zbar = mkZbar();
-    const f = await provision(zbar, ctx);
-
-    const ids = (rows: any[]) => new Set(rows.map((r) => r.objectId));
-
-    const gaDevices = await zbar
-      .list()
-      .object("device")
-      .permission("view")
-      .subject(f.uGa)
-      .collect(ctx);
-    expect(ids(gaDevices)).toEqual(new Set(["d1", "d2"]));
-
-    const ownerDevicesViaSystem = await zbar
-      .list()
-      .object("device")
-      .permission("view")
-      .subject(f.uOwner)
-      .via(f.s1)
-      .collect(ctx);
-    expect(ids(ownerDevicesViaSystem)).toEqual(new Set(["d1", "d2"]));
-
-    // Subject-mode list (users.ts pattern): groups administered by a group.
-    const adminGroups = await zbar
-      .list()
-      .object(f.d1)
-      .relation("admin")
-      .subject("group")
-      .collect(ctx);
-    expect(adminGroups.map((r: any) => r.subjectId)).toEqual(["g1"]);
-  });
-
-  test("V-pattern source lookup: device reaches rule via system#device_member", async () => {
-    const t = setup();
-    const ctx = mkCtx(t);
-    const zbar = mkZbar();
-    const f = await provision(zbar, ctx);
-
-    // notifications/debounce.ts hot path: rules whose source covers a device.
-    const rules = await zbar
-      .list()
-      .object("notification_rule")
-      .relation("source")
-      .subject(f.d1)
-      .collect(ctx);
-    expect(rules.map((r: any) => r.objectId)).toEqual(["nr1"]);
-
-    // A device from outside the system matches nothing.
-    const none = await zbar
-      .list()
-      .object("notification_rule")
-      .relation("source")
-      .subject(ref("device", "d_foreign"))
-      .collect(ctx);
-    expect(none).toEqual([]);
-  });
-
-  test("recipient edge properties round-trip through .listDirect() (resolve.ts pattern)", async () => {
-    const t = setup();
-    const ctx = mkCtx(t);
-    const zbar = mkZbar();
-    const f = await provision(zbar, ctx);
-
-    const edges = await zbar
-      .listDirect()
-      .object(f.nr1)
-      .relation("recipient")
-      .collect(ctx);
-    expect(edges).toHaveLength(1);
-    expect(edges[0].subject).toEqual({ type: "system_user", id: "su_member" });
-    expect(edges[0].properties).toEqual({ email: true, push: true });
-
-    // systemUsers.ts pattern: .map() over direct edges. The subject→object
-    // direction holds the explicit `owner` grant plus the auto-mirrored
-    // `has_system_user` reverse of the seat's `parent` edge.
-    const relations = await zbar
-      .listDirect()
-      .object(f.s1)
-      .subject(f.suOwner)
-      .map(({ relation }: any) => relation)
-      .collect(ctx);
-    expect(new Set(relations)).toEqual(new Set(["has_system_user", "owner"]));
-  });
-
-  test("role changes: remove+add (users.ts) and setRelation (migrate.ts)", async () => {
-    const t = setup();
-    const ctx = mkCtx(t);
-    const zbar = mkZbar();
-    const f = await provision(zbar, ctx);
-
-    // Promote member seat: viewer → admin via remove+add (aa-app deliberately
-    // avoids setRelation here so the parent edge is untouched).
-    await zbar.removeRelation(ctx, f.suMember, "viewer", f.s1);
-    await zbar.addRelation(ctx, f.suMember, "admin", f.s1);
-    expect(await zbar.can(ctx, f.uMember, "manage_resources", f.s1)).toBe(true);
-    expect(await zbar.can(ctx, f.uMember, "manage", f.s1)).toBe(false);
-
-    // setRelation clears every other relation between the pair atomically.
-    await zbar.setRelation(ctx, f.suMember, "viewer", f.s1);
-    expect(await zbar.can(ctx, f.uMember, "manage_resources", f.s1)).toBe(false);
-    expect(await zbar.can(ctx, f.uMember, "view", f.s1)).toBe(true);
-  });
-
-  test("deleteEntity tears down containment and access (service.ts teardown)", async () => {
-    const t = setup();
-    const ctx = mkCtx(t);
-    const zbar = mkZbar();
-    const f = await provision(zbar, ctx);
-
-    await zbar.deleteEntity(ctx, f.d1);
-    expect(await zbar.can(ctx, f.uGa, "manage", f.d1)).toBe(false);
-    expect(await zbar.can(ctx, f.uOwner, "view", f.d1)).toBe(false);
-    const devices = await zbar
-      .list()
-      .object("device")
-      .permission("view")
-      .subject(f.uGa)
-      .collect(ctx);
-    expect(devices.map((r: any) => r.objectId)).toEqual(["d2"]);
-
-    // Deleting the identity user severs the seat-derived access.
-    await zbar.deleteEntity(ctx, f.uGa);
-    expect(await zbar.can(ctx, f.uGa, "view", f.d2)).toBe(false);
-    expect(await zbar.can(ctx, f.uGa, "manage", f.g1)).toBe(false);
-  });
+  // listDirect: facts with properties; an inverse set lists its facts flipped.
+  const recipients = await zbar
+    .listDirect()
+    .object(rule2)
+    .relation("recipient")
+    .collect(ctx);
+  expect(
+    recipients
+      .map((r: any) => [
+        `${r.subject.type}:${r.subject.id}`,
+        r.properties ?? null,
+      ])
+      .sort(),
+  ).toEqual([
+    ["linked_recipient:lr1", null],
+    ["system_user:rm", { push: true, email: false }],
+  ]);
+  const members = await zbar
+    .listDirect()
+    .object(s1)
+    .relation("devices")
+    .collect(ctx);
+  expect(
+    members
+      .map((r: any) => `${r.subject.id} ${r.relation} ${r.object.id}`)
+      .sort(),
+  ).toEqual(["d1 devices s1", "d2 devices s1", "d3 devices s1"]);
 });

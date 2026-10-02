@@ -41,10 +41,10 @@ export interface ListSubjectsNeedSubject<Schema extends ZbarSchema> {
 }
 /** Ready to collect, with optional `.via()` filtering and `.map()`. */
 export interface ListCollectable<Schema extends ZbarSchema, Result> {
-    via<VT extends keyof Schema["entities"] & string>(...entities: Array<{
+    via<VT extends keyof Schema["entities"] & string>(...entities: ({
         type: VT;
         id: string;
-    } | null | undefined>): ListFinal<Result>;
+    } | null | undefined)[]): ListFinal<Result>;
     map<T>(fn: (item: Result) => T | Promise<T>): ListMapped<T>;
     collect(ctx: QueryCtx | ActionCtx): Promise<Result[]>;
 }

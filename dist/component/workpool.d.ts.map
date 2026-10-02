@@ -1,1 +1,1 @@
-{"version":3,"file":"workpool.d.ts","sourceRoot":"","sources":["../../src/component/workpool.ts"],"names":[],"mappings":"AAAA,OAAO,EAAE,QAAQ,EAAE,MAAM,sBAAsB,CAAC;AAGhD,eAAO,MAAM,aAAa,UAQxB,CAAC"}
+{"version":3,"file":"workpool.d.ts","sourceRoot":"","sources":["../../src/component/workpool.ts"],"names":[],"mappings":"AAAA,OAAO,EAAE,QAAQ,EAAE,MAAM,sBAAsB,CAAC;AAGhD;;;;GAIG;AACH,eAAO,MAAM,aAAa,UAOxB,CAAC"}

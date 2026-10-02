@@ -1,655 +1,550 @@
-import { expect, test, describe } from "vitest";
-import { convexTest } from "convex-test";
-import schema from "../schema.js";
-import { api } from "../_generated/api.js";
-import type { GraphConfig } from "../types.js";
-import { register as registerWorkpool } from "@convex-dev/workpool/test";
-
-const setup = () => {
-  const t = convexTest(schema, import.meta.glob("../**/*.ts"));
-  registerWorkpool(t, "workpool");
-  return t;
-};
-
-// Config arg shared by every direct mutation call. The component registers the
-// compiled config the first time a hash is seen (idempotent), so passing both
-// `configHash` and `graphConfig` on each call is safe.
-const cfg = (graphConfig: GraphConfig) => ({
-  configHash: "test-cfg",
+/**
+ * EXPANSION.md P1 (idempotence), P5 (depth), P6 (rebuild: retired rules,
+ * upstream edits, a lowered maxDepth, the paths cap), Lemma Q (the active
+ * config: rollbacks rebuild, stale cursors are dropped, old paths never block
+ * the cap), and the seed guarantee (CONTRACT §5.3). Configs are written by hand, or compiled where the claim
+ * is about the compiler's keys.
+ */
+import { zbarEngineTest } from "../../test";
+import type { WorkId } from "@convex-dev/workpool";
+import { describe, expect, test } from "vitest";
+import { createZbarSchema, materialize } from "../../client/index";
+import {
+  ALL_RULES,
+  MANAGE,
+  ORG,
+  TEAM,
+  type Task,
+  drain,
+  engine,
+  expectExact,
   graphConfig,
+  parked,
+  portable,
+  rule,
+  runTask,
+  snapshot,
+} from "../../client/tests/expansion-harness";
+import { api, internal } from "../_generated/api";
+import {
+  deleteFact,
+  execute,
+  findFact,
+  findRow,
+  insertFact,
+  type Env,
+} from "../expand";
+import { parseSchemaToGraphConfig } from "../helpers";
+import { MAX_PATHS } from "../paths";
+
+describe("P1 idempotence: a chunk run twice changes nothing", () => {
+  test("re-running a parked cursor leaves the table identical, and the drain still matches the reference", async () => {
+    const t = zbarEngineTest();
+    const z = engine(t, graphConfig(ALL_RULES, { writeBudget: 2 }));
+    for (const u of ["u1", "u2", "u3"])
+      await z.add(`user:${u}`, "member", "squad:s1");
+    await z.add("team:t1", "viewer", "org:o1");
+    await drain(t);
+    await z.add("squad:s1", "member", "team:t1"); // parks derived work: 3 seats × 2 hops
+
+    // Every cursor of the first few rounds runs twice in a row; each re-run
+    // re-parks its continuation, so later rounds also see duplicated cursors.
+    for (let round = 0; round < 6; round++) {
+      const [task] = await parked(t);
+      if (!task) break;
+      await runTask(t, task);
+      const once = (await snapshot(t)).rows;
+      await t.mutation(internal.mutations.continueExpansion, task.args);
+      expect((await snapshot(t)).rows).toEqual(once);
+    }
+    expect((await parked(t)).length).toBeGreaterThan(0);
+    await drain(t);
+    await expectExact(t, ALL_RULES, 16);
+  });
 });
 
-// Inspect effective rows for (subject, relations, object) via the collapsed
-// forward query.
-const checkFast = (
-  runner: any,
-  a: { subject: any; relations: string[]; object: any },
-) =>
-  runner.query(api.queries.effectiveForward, {
-    subjects: [a.subject],
-    relations: a.relations,
-    objectPoints: [`${a.object.type}:${a.object.id}`],
-  });
-
-describe("ReBAC Core Engine (v3)", () => {
-  test("direct relationships are correctly inserted into relationships and effectiveRelationships", async () => {
-    const t = setup();
-
-    // Simplest possible graph with no traversals
-    const graphConfig: GraphConfig = {
-      traversalRules: [],
-    };
-
-    const user = { type: "user", id: "user1" };
-    const org = { type: "org", id: "org1" };
-    const relation = "owner";
-
-    // 1. Add direct relation
-    await t.mutation(api.mutations.addRelation, {
-      subject: user,
-      relation,
-      object: org,
-      ...cfg(graphConfig),
-    });
-
-    // 2. Query relationships to ensure it exists
-    const rels = await checkFast(t, {
-      subject: user,
-      relations: [relation],
-      object: org,
-    });
-
-    expect(rels.length).toBe(1);
-    expect(rels[0].relation).toBe(relation);
-    expect(rels[0].paths.length).toBe(1);
-  });
-
-  test("cross-object derived relationships are correctly expanded", async () => {
-    const t = setup();
-
-    // Project editor includes parent_org admin
-    // sourceObject: Project, sourceRelation: parent_org, targetRelation: admin, derivedRelation: editor
-    const graphConfig: GraphConfig = {
-      traversalRules: [
-        {
-          sourceObjectType: "project",
-          sourceRelation: "parent_org",
-          targetRelation: "admin",
-          derivedRelation: "editor",
-        },
-      ],
-    };
-
-    const user = { type: "user", id: "user1" };
-    const org = { type: "org", id: "org1" };
-    const project = { type: "project", id: "proj1" };
-
-    // 1. Link Project to Org
-    await t.mutation(api.mutations.addRelation, {
-      subject: org,
-      relation: "parent_org",
-      object: project,
-      ...cfg(graphConfig),
-    });
-
-    // 2. Add user as admin to Org
-    await t.mutation(api.mutations.addRelation, {
-      subject: user,
-      relation: "admin",
-      object: org,
-      ...cfg(graphConfig),
-    });
-
-    // 3. Query effective relationships on Project
-    const rels = await checkFast(t, {
-      subject: user,
-      relations: ["editor"],
-      object: project,
-    });
-
-    expect(rels.length).toBe(1);
-    expect(rels[0].relation).toBe("editor");
-    expect(rels[0].paths.length).toBe(1);
-  });
-
-  test("removeRelation cleans up derived relationships", async () => {
-    const t = setup();
-    const graphConfig: GraphConfig = {
-      traversalRules: [
-        {
-          sourceObjectType: "project",
-          sourceRelation: "parent_org",
-          targetRelation: "admin",
-          derivedRelation: "editor",
-        },
-      ],
-    };
-
-    const user = { type: "user", id: "user1" };
-    const org = { type: "org", id: "org1" };
-    const project = { type: "project", id: "proj1" };
-
-    // Setup initial state
-    await t.mutation(api.mutations.addRelation, {
-      subject: org,
-      relation: "parent_org",
-      object: project,
-      ...cfg(graphConfig),
-    });
-
-    await t.mutation(api.mutations.addRelation, {
-      subject: user,
-      relation: "admin",
-      object: org,
-      ...cfg(graphConfig),
-    });
-
-    // Verify it exists
-    const relsBefore = await checkFast(t, {
-      subject: user,
-      relations: ["editor"],
-      object: project,
-    });
-    expect(relsBefore.length).toBe(1);
-
-    // Remove relation
-    await t.mutation(api.mutations.removeRelation, {
-      subject: user,
-      relation: "admin",
-      object: org,
-      ...cfg(graphConfig),
-    });
-
-    // Verify it is gone
-    const relsAfter = await checkFast(t, {
-      subject: user,
-      relations: ["editor"],
-      object: project,
-    });
-    expect(relsAfter.length).toBe(0);
-  });
-
-  test("multiple paths to a document are tracked and surgically deleted", async () => {
-    const t = setup();
-    const graphConfig: GraphConfig = {
-      traversalRules: [
-        {
-          sourceObjectType: "document",
-          sourceRelation: "parent_project",
-          targetRelation: "editor",
-          derivedRelation: "viewer",
-        },
-      ],
-    };
-
-    const user = { type: "user", id: "u1" };
-    const doc1 = { type: "document", id: "d1" };
-    const doc2 = { type: "document", id: "d2" };
-
-    const proj1 = { type: "project", id: "p1" };
-    const proj2 = { type: "project", id: "p2" };
-    const proj3 = { type: "project", id: "p3" };
-
-    // Link doc1 to all 3 projects
-    await t.mutation(api.mutations.addRelation, {
-      subject: proj1,
-      relation: "parent_project",
-      object: doc1,
-      ...cfg(graphConfig),
-    });
-    await t.mutation(api.mutations.addRelation, {
-      subject: proj2,
-      relation: "parent_project",
-      object: doc1,
-      ...cfg(graphConfig),
-    });
-    await t.mutation(api.mutations.addRelation, {
-      subject: proj3,
-      relation: "parent_project",
-      object: doc1,
-      ...cfg(graphConfig),
-    });
-
-    // Link doc2 to proj1 and proj2
-    await t.mutation(api.mutations.addRelation, {
-      subject: proj1,
-      relation: "parent_project",
-      object: doc2,
-      ...cfg(graphConfig),
-    });
-    await t.mutation(api.mutations.addRelation, {
-      subject: proj2,
-      relation: "parent_project",
-      object: doc2,
-      ...cfg(graphConfig),
-    });
-
-    // Add user as editor to all 3 projects
-    await t.mutation(api.mutations.addRelation, {
-      subject: user,
-      relation: "editor",
-      object: proj1,
-      ...cfg(graphConfig),
-    });
-    await t.mutation(api.mutations.addRelation, {
-      subject: user,
-      relation: "editor",
-      object: proj2,
-      ...cfg(graphConfig),
-    });
-    await t.mutation(api.mutations.addRelation, {
-      subject: user,
-      relation: "editor",
-      object: proj3,
-      ...cfg(graphConfig),
-    });
-
-    // Check paths for doc1
-    let relsDoc1 = await checkFast(t, {
-      subject: user,
-      relations: ["viewer"],
-      object: doc1,
-    });
-    expect(relsDoc1.length).toBe(1); // 1 effective relationship
-    expect(relsDoc1[0].paths.length).toBe(3); // 3 paths (one per project)
-
-    // Check paths for doc2
-    let relsDoc2 = await checkFast(t, {
-      subject: user,
-      relations: ["viewer"],
-      object: doc2,
-    });
-    expect(relsDoc2[0].paths.length).toBe(2);
-
-    // 1. Delete user editor of proj2
-    await t.mutation(api.mutations.removeRelation, {
-      subject: user,
-      relation: "editor",
-      object: proj2,
-      ...cfg(graphConfig),
-    });
-
-    relsDoc1 = await checkFast(t, {
-      subject: user,
-      relations: ["viewer"],
-      object: doc1,
-    });
-    expect(relsDoc1[0].paths.length).toBe(2);
-
-    relsDoc2 = await checkFast(t, {
-      subject: user,
-      relations: ["viewer"],
-      object: doc2,
-    });
-    expect(relsDoc2[0].paths.length).toBe(1);
-
-    // 2. Delete doc1 parent_project proj3
-    await t.mutation(api.mutations.removeRelation, {
-      subject: proj3,
-      relation: "parent_project",
-      object: doc1,
-      ...cfg(graphConfig),
-    });
-
-    relsDoc1 = await checkFast(t, {
-      subject: user,
-      relations: ["viewer"],
-      object: doc1,
-    });
-    expect(relsDoc1[0].paths.length).toBe(1);
-
-    // 3. Delete user editor of proj1
-    await t.mutation(api.mutations.removeRelation, {
-      subject: user,
-      relation: "editor",
-      object: proj1,
-      ...cfg(graphConfig),
-    });
-
-    relsDoc1 = await checkFast(t, {
-      subject: user,
-      relations: ["viewer"],
-      object: doc1,
-    });
-    expect(relsDoc1.length).toBe(0); // The effective relationship should be completely deleted
-
-    relsDoc2 = await checkFast(t, {
-      subject: user,
-      relations: ["viewer"],
-      object: doc2,
-    });
-    expect(relsDoc2.length).toBe(0);
-  });
-
-  test("deep connections (3+ hops) are correctly expanded and cleaned up", async () => {
-    const t = setup();
-    const graphConfig: GraphConfig = {
-      traversalRules: [
-        {
-          sourceObjectType: "document",
-          sourceRelation: "parent_folder",
-          targetRelation: "admin",
-          derivedRelation: "admin",
-        },
-        {
-          sourceObjectType: "folder",
-          sourceRelation: "parent_project",
-          targetRelation: "admin",
-          derivedRelation: "admin",
-        },
-        {
-          sourceObjectType: "project",
-          sourceRelation: "parent_org",
-          targetRelation: "admin",
-          derivedRelation: "admin",
-        },
-      ],
-    };
-
-    const user = { type: "user", id: "u_deep" };
-    const org = { type: "org", id: "org1" };
-    const project = { type: "project", id: "proj1" };
-    const folder = { type: "folder", id: "folder1" };
-    const document = { type: "document", id: "doc1" };
-
-    // 1. Build the chain from bottom up
-    await t.mutation(api.mutations.addRelation, {
-      subject: folder,
-      relation: "parent_folder",
-      object: document,
-      ...cfg(graphConfig),
-    });
-    await t.mutation(api.mutations.addRelation, {
-      subject: project,
-      relation: "parent_project",
-      object: folder,
-      ...cfg(graphConfig),
-    });
-    await t.mutation(api.mutations.addRelation, {
-      subject: org,
-      relation: "parent_org",
-      object: project,
-      ...cfg(graphConfig),
-    });
-
-    // 2. Add the user at the very top (org admin)
-    await t.mutation(api.mutations.addRelation, {
-      subject: user,
-      relation: "admin",
-      object: org,
-      ...cfg(graphConfig),
-    });
-
-    // 3. Verify user has admin on the document (3 hops away)
-    let relsDoc = await checkFast(t, {
-      subject: user,
-      relations: ["admin"],
-      object: document,
-    });
-    expect(relsDoc.length).toBe(1);
-    expect(relsDoc[0].paths[0].baseIds.length).toBeGreaterThan(3); // Should have accumulated several tokens
-
-    // Verify user has admin on the folder (2 hops away)
-    let relsFolder = await checkFast(t, {
-      subject: user,
-      relations: ["admin"],
-      object: folder,
-    });
-    expect(relsFolder.length).toBe(1);
-
-    // Verify user has admin on the project (1 hop away)
-    let relsProject = await checkFast(t, {
-      subject: user,
-      relations: ["admin"],
-      object: project,
-    });
-    expect(relsProject.length).toBe(1);
-
-    // 4. Break the chain in the middle (remove folder from project)
-    await t.mutation(api.mutations.removeRelation, {
-      subject: project,
-      relation: "parent_project",
-      object: folder,
-      ...cfg(graphConfig),
-    });
-
-    // Document admin should be gone
-    relsDoc = await checkFast(t, {
-      subject: user,
-      relations: ["admin"],
-      object: document,
-    });
-    expect(relsDoc.length).toBe(0);
-
-    // Folder admin should be gone
-    relsFolder = await checkFast(t, {
-      subject: user,
-      relations: ["admin"],
-      object: folder,
-    });
-    expect(relsFolder.length).toBe(0);
-
-    // Project admin should STILL exist!
-    relsProject = await checkFast(t, {
-      subject: user,
-      relations: ["admin"],
-      object: project,
-    });
-    expect(relsProject.length).toBe(1);
-
-    // 5. Re-link folder to project to restore the chain
-    await t.mutation(api.mutations.addRelation, {
-      subject: project,
-      relation: "parent_project",
-      object: folder,
-      ...cfg(graphConfig),
-    });
-
-    relsDoc = await checkFast(t, {
-      subject: user,
-      relations: ["admin"],
-      object: document,
-    });
-    expect(relsDoc.length).toBe(1); // Restored!
-
-    // 6. Delete user from org
-    await t.mutation(api.mutations.removeRelation, {
-      subject: user,
-      relation: "admin",
-      object: org,
-      ...cfg(graphConfig),
-    });
-
-    // Entire chain of derived access should collapse
-    relsDoc = await checkFast(t, {
-      subject: user,
-      relations: ["admin"],
-      object: document,
-    });
-    expect(relsDoc.length).toBe(0);
-
-    relsProject = await checkFast(t, {
-      subject: user,
-      relations: ["admin"],
-      object: project,
-    });
-    expect(relsProject.length).toBe(0);
-  });
-
-  test("cycle detection prevents infinite loops", async () => {
-    const t = setup();
-
-    const graphConfig: GraphConfig = {
-      traversalRules: [
-        {
-          sourceObjectType: "node",
-          sourceRelation: "link",
-          targetRelation: "link",
-          derivedRelation: "link",
-        },
-      ],
-    };
-
-    const n1 = { type: "node", id: "1" };
-    const n2 = { type: "node", id: "2" };
-
-    // If cycle detection doesn't work, deriving link -> link -> link will infinite loop
-    await t.mutation(api.mutations.addRelation, {
-      subject: n1,
-      relation: "link",
-      object: n2,
-      ...cfg(graphConfig),
-    });
-    await t.mutation(api.mutations.addRelation, {
-      subject: n2,
-      relation: "link",
-      object: n2,
-      ...cfg(graphConfig),
-    });
-    await t.mutation(api.mutations.addRelation, {
-      subject: n2,
-      relation: "link",
-      object: n1,
-      ...cfg(graphConfig),
-    });
-
-    const rels = await checkFast(t, {
-      subject: n1,
-      relations: ["link"],
-      object: n1,
-    });
-
-    expect(rels).toBeDefined();
-  });
-
-  test("maxWriteDepth halts deep derivations", async () => {
-    const t = setup();
-
-    const graphConfig: GraphConfig = {
-      traversalRules: [
-        {
-          sourceObjectType: "node",
-          sourceRelation: "next",
-          targetRelation: "reachable",
-          derivedRelation: "reachable",
-        },
-      ],
-      maxWriteDepth: 2, // Severely limit depth
-    };
-
-    const n1 = { type: "node", id: "1" };
-    const n2 = { type: "node", id: "2" };
-    const n3 = { type: "node", id: "3" };
-    const n4 = { type: "node", id: "4" };
-
-    // Link them together with next
-    await t.mutation(api.mutations.addRelation, {
-      subject: n1,
-      relation: "next",
-      object: n2,
-      ...cfg(graphConfig),
-    });
-    await t.mutation(api.mutations.addRelation, {
-      subject: n2,
-      relation: "next",
-      object: n3,
-      ...cfg(graphConfig),
-    });
-    await t.mutation(api.mutations.addRelation, {
-      subject: n3,
-      relation: "next",
-      object: n4,
-      ...cfg(graphConfig),
-    });
-
-    // Now trigger the cascade with a single write!
-    await t.mutation(api.mutations.addRelation, {
-      subject: n1,
-      relation: "reachable",
-      object: n2,
-      ...cfg(graphConfig),
-    });
-
-    // Because maxWriteDepth is 2, the derivation should stop before n1 reaches n4
-    const rels = await checkFast(t, {
-      subject: n1,
-      relations: ["reachable"],
-      object: n4,
-    });
-
-    expect(rels.length).toBe(0); // Should not reach n4
-  });
-
-  test("asyncWrites correctly processes BFS via workpool", async () => {
-    const t = setup();
-    const graphConfig: GraphConfig = {
-      traversalRules: [
-        {
-          sourceObjectType: "project",
-          sourceRelation: "parent_org",
-          targetRelation: "admin",
-          derivedRelation: "editor",
-        },
-      ],
-    };
-
-    const user = { type: "user", id: "u_async" };
-    const org = { type: "org", id: "org_async" };
-    const project = { type: "project", id: "proj_async" };
-
-    // Add relation with asyncWrites: true
-    await t.mutation(api.mutations.addRelation, {
-      subject: org,
-      relation: "parent_org",
-      object: project,
-      ...cfg(graphConfig),
-      asyncWrites: true,
-    });
-
-    await t.mutation(api.mutations.addRelation, {
-      subject: user,
-      relation: "admin",
-      object: org,
-      ...cfg(graphConfig),
-      asyncWrites: true,
-    });
-
-    // Run workpool scheduled jobs
-    for (let i = 0; i < 10; i++) {
-      await t.finishInProgressScheduledFunctions();
-      // Sleep a tiny bit to allow event loop
-      await new Promise((r) => setTimeout(r, 50));
+describe("P5 depth: bounded by the facts, not by write order", () => {
+  const chain = ["g0", "g1", "g2", "g3", "g4", "g5", "g6"];
+  type Fact = readonly [string, string, string];
+  const parents: Fact[] = chain
+    .slice(1)
+    .map((g, i) => [`group:${chain[i]}`, "parent", `group:${g}`]);
+  const grant: Fact = ["user:u", "manage", "group:g0"];
+
+  async function build(order: Fact[]) {
+    const t = zbarEngineTest();
+    const z = engine(t, graphConfig([MANAGE], { writeBudget: 2, maxDepth: 4 }));
+    for (const f of order) {
+      await z.add(...f);
+      await drain(t);
     }
+    await expectExact(t, [MANAGE], 4);
+    return portable(t);
+  }
 
-    const rels = await checkFast(t, {
-      subject: user,
-      relations: ["editor"],
-      object: project,
-    });
-
-    expect(rels.length).toBe(1);
-    expect(rels[0].relation).toBe("editor");
-
-    // Remove relation with asyncWrites: true
-    await t.mutation(api.mutations.removeRelation, {
-      subject: user,
-      relation: "admin",
-      object: org,
-      ...cfg(graphConfig),
-      asyncWrites: true,
-    });
-
-    for (let i = 0; i < 10; i++) {
-      await t.finishInProgressScheduledFunctions();
-      await new Promise((r) => setTimeout(r, 50));
+  test("grant first or last: same rows, no path over maxDepth, one depth failure", async () => {
+    const forward = await build([grant, ...parents]);
+    const backward = await build([...parents].reverse().concat([grant]));
+    expect(forward.rows).toEqual(backward.rows);
+    // u reaches g0..g3 (lineages of 1..4 facts); g4 would need 5.
+    expect(
+      forward.rows.filter((r) => r.startsWith("user:u manage")),
+    ).toHaveLength(4);
+    for (const s of [forward, backward]) {
+      expect(s.failures).toHaveLength(1);
+      expect(s.failures[0].reason).toBe("depth");
+      expect(s.failures[0].cursor.path.baseIds).toHaveLength(5);
     }
+  });
+});
 
-    const relsAfter = await checkFast(t, {
-      subject: user,
-      relations: ["editor"],
-      object: project,
+describe("P6 rebuild", () => {
+  test("an arm going from materialized to computed retires exactly its rule; back again restores the reference", async () => {
+    const t = zbarEngineTest();
+    const both = engine(t, graphConfig([TEAM, ORG]), "A");
+    await both.add("user:u1", "member", "squad:s1");
+    await both.add("squad:s1", "member", "team:t1");
+    await both.add("user:u2", "member", "team:t1");
+    await both.add("team:t1", "viewer", "org:o1");
+    await both.add("user:u1", "viewer", "org:o1"); // a fact on a row ORG also derives
+    await drain(t);
+    const before = await expectExact(t, [TEAM, ORG], 16);
+    expect(
+      before.rows.some((r: any) =>
+        r.paths.some((p: any) => p.rule === ORG.key),
+      ),
+    ).toBe(true);
+
+    // org.viewer's team#member arm becomes computed: config B has no ORG rule.
+    const teamOnly = engine(t, graphConfig([TEAM]), "B");
+    await teamOnly.rebuild();
+    await drain(t);
+    const after = await expectExact(t, [TEAM], 16);
+
+    const strip = (rows: any[]) =>
+      rows
+        .map((r) => ({
+          ...r,
+          paths: r.paths.filter((p: any) => p.rule !== ORG.key),
+        }))
+        .filter((r) => r.paths.length > 0);
+    expect(after.rows).toEqual(strip(before.rows)); // same documents, ORG paths gone
+    expect(
+      after.rows.some(
+        (r: any) => r.relation === "viewer" && r.subjectKey === "user:u1",
+      ),
+    ).toBe(true);
+
+    await both.rebuild();
+    await drain(t);
+    await expectExact(t, [TEAM, ORG], 16);
+  });
+});
+
+describe("P6 rebuild repairs what a config change or a bound leaves behind", () => {
+  // squad → team → org, both materialized. S2 edits only the UPSTREAM arm
+  // (team.member now expands squad#admin): org.viewer's own arm and second
+  // hop are unchanged, yet every org.viewer row derived through a squad
+  // member is wrong under S2.
+  const schema = (teamArm: string) =>
+    createZbarSchema()
+      .entity("user")
+      .entity("squad", (e) =>
+        e.relation("member", "user").relation("admin", "user"),
+      )
+      .entity("team", (e) =>
+        e.relation("member", "user", materialize(teamArm as "squad#member")),
+      )
+      .entity("org", (e) => e.relation("viewer", materialize("team#member")))
+      .build();
+  const compiled = (teamArm: string) => ({
+    ...parseSchemaToGraphConfig(schema(teamArm)),
+    mockWorkpool: true,
+  });
+
+  test("an upstream edit changes the downstream rule key, and rebuild retires the old rows", async () => {
+    const s1 = compiled("squad#member");
+    const s2 = compiled("squad#admin");
+    const orgKey = (c: typeof s1) =>
+      c.rules.find((r) => r.objectType === "org")!.key;
+    const base = (key: string) => key.slice(0, key.lastIndexOf("@"));
+    expect(base(orgKey(s2))).toBe(base(orgKey(s1))); // the arm itself did not change …
+    expect(orgKey(s2)).not.toBe(orgKey(s1)); //          … its upstream did
+
+    const t = zbarEngineTest();
+    const one = engine(t, s1, "S1");
+    await one.add("user:u", "member", "squad:s");
+    await one.add("squad:s", "member", "team:t");
+    await one.add("team:t", "viewer", "org:o");
+    await drain(t);
+    await expectExact(t, s1.rules, 16);
+    expect(
+      (await snapshot(t)).rows.some(
+        (r: any) => r.relation === "viewer" && r.subjectKey === "user:u",
+      ),
+    ).toBe(true);
+
+    await engine(t, s2, "S2").rebuild();
+    await drain(t);
+    await expectExact(t, s2.rules, 16); // u is no squad admin: no team.member, no org.viewer
+    const keys = new Set(s2.rules.map((r) => r.key).concat("fact"));
+    for (const r of (await snapshot(t)).rows)
+      for (const p of r.paths) expect(keys.has(p.rule)).toBe(true);
+  });
+
+  test("rebuild after maxDepth is lowered drops every path over the new bound", async () => {
+    const t = zbarEngineTest();
+    const deep = engine(t, graphConfig([MANAGE]), "D16");
+    await deep.add("user:u", "manage", "group:g0");
+    for (let i = 0; i < 5; i++)
+      await deep.add(`group:g${i}`, "parent", `group:g${i + 1}`);
+    await drain(t);
+    expect(
+      (await snapshot(t)).rows.some((r: any) =>
+        r.paths.some((p: any) => p.baseIds.length > 3),
+      ),
+    ).toBe(true);
+
+    await engine(t, graphConfig([MANAGE], { maxDepth: 3 }), "D3").rebuild();
+    await drain(t);
+    await expectExact(t, [MANAGE], 3);
+    expect((await snapshot(t)).failures.map((f: any) => f.reason)).toContain(
+      "depth",
+    );
+  });
+
+  test(`a row past ${MAX_PATHS} paths records a failure; an early retraction is repaired by rebuild`, async () => {
+    const t = zbarEngineTest();
+    const z = engine(t, graphConfig([TEAM]));
+    const squads = Array.from(
+      { length: MAX_PATHS + 1 },
+      (_, i) => `squad:s${String(i).padStart(2, "0")}`,
+    );
+    for (const s of squads) await z.add(s, "member", "team:t");
+    for (const s of squads) await z.add("user:u", "member", s);
+    await drain(t);
+    const derived = () =>
+      snapshot(t).then((x) =>
+        x.rows.find(
+          (r: any) => r.subjectKey === "user:u" && r.objectKey === "team:t",
+        ),
+      );
+    expect((await derived()).paths).toHaveLength(MAX_PATHS);
+    // At least once (the auto-rebuild re-attempts it): only ever 'paths'.
+    const reasons = new Set(
+      (await snapshot(t)).failures.map((f: any) => f.reason),
+    );
+    expect(reasons).toEqual(new Set(["paths"]));
+
+    // Remove the squad links of every stored path: the row goes although the
+    // refused path's facts all remain (the early retraction CONTRACT §5.2 allows).
+    const { facts } = await snapshot(t);
+    const stored = new Set(
+      (await derived()).paths.flatMap((p: any) => p.baseIds),
+    );
+    for (const f of facts) {
+      if (f.s === "user:u" && stored.has(f.id)) await z.remove(f.s, f.r, f.o);
+    }
+    await drain(t);
+    expect(await derived()).toBeUndefined();
+
+    await z.rebuild();
+    await drain(t);
+    expect((await derived()).paths).toHaveLength(1);
+    await expectExact(t, [TEAM], 16);
+  });
+});
+
+describe("Lemma Q: the active config decides what the table holds", () => {
+  const facts: [string, string, string][] = [
+    ["user:u", "member", "squad:s"],
+    ["squad:s", "member", "team:t"],
+    ["team:t", "viewer", "org:o"],
+    ["user:v", "member", "team:t"],
+  ];
+  const orgPaths = async (t: any) =>
+    (await snapshot(t)).rows.flatMap((r: any) =>
+      r.paths.filter((p: any) => p.rule === ORG.key),
+    );
+  const kinds = async (t: any) =>
+    (await parked(t)).flatMap((x) => x.args.items.map((i: any) => i.kind));
+
+  // Probe A: switching to a config that is already registered (a rollback)
+  // must rebuild under it, in both directions, and leave it exact.
+  test("A → B → A: the rollback to A rebuilds, and the ORG rows come back", async () => {
+    const t = zbarEngineTest();
+    const a = engine(t, graphConfig([TEAM, ORG]), "A");
+    const b = engine(t, graphConfig([TEAM]), "B");
+    for (const f of facts) await a.add(...f);
+    expect(await kinds(t)).not.toContain("rebuild"); // first activation, empty component
+    await drain(t);
+    await expectExact(t, [TEAM, ORG], 16);
+    expect(await orgPaths(t)).not.toEqual([]);
+
+    await b.add(...facts[0]); // first write under B (an idempotent add)
+    expect(await kinds(t)).toEqual(["rebuild"]);
+    await drain(t);
+    await expectExact(t, [TEAM], 16);
+    expect(await orgPaths(t)).toEqual([]);
+
+    await a.add(...facts[0]); // roll back: A is registered already, yet it is not active
+    expect(await kinds(t)).toEqual(["rebuild"]);
+    await drain(t);
+    await expectExact(t, [TEAM, ORG], 16);
+    expect(await orgPaths(t)).not.toEqual([]);
+    expect((await snapshot(t)).failures).toEqual([]);
+  });
+
+  test("B → A → B: the rollback to B leaves no stale ORG row", async () => {
+    const t = zbarEngineTest();
+    const a = engine(t, graphConfig([TEAM, ORG]), "A");
+    const b = engine(t, graphConfig([TEAM]), "B");
+    for (const f of facts) await b.add(...f);
+    await drain(t);
+    await expectExact(t, [TEAM], 16);
+
+    await a.add(...facts[0]);
+    await drain(t);
+    await expectExact(t, [TEAM, ORG], 16);
+    expect(await orgPaths(t)).not.toEqual([]);
+
+    await b.add(...facts[0]);
+    expect(await kinds(t)).toEqual(["rebuild"]);
+    await drain(t);
+    await expectExact(t, [TEAM], 16);
+    expect(await orgPaths(t)).toEqual([]);
+  });
+
+  test("facts but no active row (written before the row existed): the first write rebuilds", async () => {
+    const t = zbarEngineTest();
+    const a = engine(t, graphConfig([TEAM, ORG]), "A");
+    for (const f of facts) await a.add(...f);
+    await drain(t);
+    await t.run(async (ctx: any) => {
+      for (const r of await ctx.db.query("activeConfig").collect())
+        await ctx.db.delete(r._id);
     });
+    await a.add(...facts[0]);
+    expect(await kinds(t)).toEqual(["rebuild"]);
+  });
 
-    expect(relsAfter.length).toBe(0);
+  // Probe B: C1 derives (u viewer o) from {a, b}; C2 only from {a, b, c}. A
+  // C1 add/second cursor parked before C2 became active must not run, before
+  // or after C2's retire passes the row: run, its old `isCurrent` prunes C2's
+  // superset path {a,b,c} and stores {a,b} under a key C2 does not know.
+  const ORG_ADMIN = rule({
+    objectType: "org",
+    derived: "admin",
+    firstHop: "admin",
+    intermediateType: "team",
+    relations: ["member"],
+    target: "admin",
+  });
+  const VIP = rule({
+    objectType: "team",
+    derived: "vip",
+    firstHop: "member",
+    intermediateType: "user",
+    relations: ["self"],
+    target: "vip",
+  });
+  const ORG_VIP = rule({
+    objectType: "org",
+    derived: "viewer",
+    firstHop: "viewer",
+    intermediateType: "team",
+    relations: ["vip"],
+    target: "vip",
+  });
+  const C1 = [ORG_ADMIN, ORG];
+  const C2 = [VIP, ORG_VIP];
+
+  /** Run parked cursors, never one matching `hold`, until only those are left. */
+  async function drainExcept(t: any, hold: (task: Task) => boolean) {
+    for (let i = 0; i < 10_000; i++) {
+      const next = (await parked(t)).find((x) => !hold(x));
+      if (!next) return;
+      await runTask(t, next);
+    }
+    throw new Error("drainExcept did not terminate");
+  }
+
+  for (const when of ["before", "after"] as const) {
+    test(`a parked C1 cursor run ${when} C2's retire passes the row writes nothing, and nothing is recorded`, async () => {
+      const t = zbarEngineTest();
+      const c1 = engine(t, graphConfig(C1, { writeBudget: 1 }), "C1");
+      const c2 = engine(t, graphConfig(C2, { writeBudget: 1 }), "C2");
+      await c1.add("team:t", "viewer", "org:o"); // b
+      await drain(t);
+      await c1.add("user:u", "member", "team:t"); // a: ORG_ADMIN's item runs, ORG's is parked
+      const [old] = await parked(t);
+      expect(old.args).toMatchObject({
+        configHash: "C1",
+        items: [{ kind: "add", trigger: "second", rule: ORG.key }],
+      });
+
+      await c2.add("user:u", "self", "user:u"); // c: C2 becomes active
+      const isOld = (x: Task) => x._id === old._id;
+      const isRetire = (x: Task) =>
+        x.args.items.some(
+          (i: any) => i.kind === "rebuild" && i.phase === "retire",
+        );
+      await drainExcept(
+        t,
+        when === "before" ? (x) => isOld(x) || isRetire(x) : isOld,
+      );
+      if (when === "before") {
+        expect((await parked(t)).some(isRetire)).toBe(true);
+        const row = (await snapshot(t)).rows.find(
+          (r: any) => r.subjectKey === "user:u" && r.relation === "viewer",
+        );
+        expect(row.paths.map((p: any) => p.rule)).toEqual([ORG_VIP.key]); // {a,b,c}, which C1 would prune
+      }
+      const before = (await snapshot(t)).rows;
+      await runTask(t, old);
+      expect((await snapshot(t)).rows).toEqual(before);
+
+      await drain(t);
+      await expectExact(t, C2, 16);
+      expect((await snapshot(t)).failures).toEqual([]);
+    });
+  }
+
+  test("a stale cursor is dropped by chunkCompleted and resumeExpansion, not retried or recorded", async () => {
+    const t = zbarEngineTest();
+    const c1 = engine(t, graphConfig(C1), "C1");
+    const c2 = engine(t, graphConfig(C2), "C2");
+    await c1.add("team:t", "viewer", "org:o");
+    await c2.add("team:t", "viewer", "org:o"); // C2 active
+    await drain(t);
+    const cursor = {
+      items: [
+        {
+          kind: "add" as const,
+          trigger: "second" as const,
+          row: {
+            subjectKey: "user:u",
+            relation: "member",
+            objectKey: "team:t",
+          },
+          rule: ORG.key,
+          paths: [],
+          after: null,
+        },
+      ],
+      configHash: "C1",
+      budget: 1,
+      attempts: 4, // one more failure would record it, were it not stale
+    };
+    await t.mutation(internal.mutations.chunkCompleted, {
+      workId: "w" as WorkId,
+      context: cursor,
+      result: { kind: "failed", error: "boom" },
+    });
+    expect((await snapshot(t)).failures).toEqual([]);
+
+    const failureId = await t.run(async (ctx: any) =>
+      ctx.db.insert("expansionFailures", {
+        cursor,
+        reason: "failed",
+        error: "boom",
+        attempts: 5,
+        createdAt: 0,
+      }),
+    );
+    await t.mutation(api.mutations.resumeExpansion, { failureId });
+    expect((await snapshot(t)).failures).toEqual([]);
+    expect(await parked(t)).toEqual([]);
+  });
+
+  // Probe C: 32 paths of the old config fill the row; the new config derives
+  // it once. Old paths never count against the cap, so the one auto-rebuild
+  // stores the new path (evicting an old one) and retires the rest.
+  test(`${MAX_PATHS} old-config paths on a row never block the new config's path`, async () => {
+    const t = zbarEngineTest();
+    const ORG_SQUAD = rule({
+      objectType: "org",
+      derived: "viewer",
+      firstHop: "viewer",
+      intermediateType: "squad",
+      relations: ["member"],
+      target: "squad",
+    });
+    const old = engine(t, graphConfig([ORG]), "OLD");
+    const next = engine(t, graphConfig([ORG_SQUAD], { writeBudget: 2 }), "NEW");
+    for (let i = 0; i < MAX_PATHS; i++) {
+      const team = `team:t${String(i).padStart(2, "0")}`;
+      await old.add("user:u", "member", team);
+      await old.add(team, "viewer", "org:o");
+    }
+    await old.add("user:u", "member", "squad:s");
+    await old.add("squad:s", "viewer", "org:o");
+    await drain(t);
+    const row = async () =>
+      (await snapshot(t)).rows.find(
+        (r: any) =>
+          r.subjectKey === "user:u" &&
+          r.relation === "viewer" &&
+          r.objectKey === "org:o",
+      );
+    expect((await row()).paths).toHaveLength(MAX_PATHS);
+    expect((await snapshot(t)).failures).toEqual([]);
+
+    await next.add("user:u", "member", "squad:s"); // NEW becomes active: one auto-rebuild
+    expect(await kinds(t)).toEqual(["rebuild"]);
+    // Before retire: the new path is stored and an old one evicted (P7: never over the cap).
+    const isRetire = (x: Task) =>
+      x.args.items.some(
+        (i: any) => i.kind === "rebuild" && i.phase === "retire",
+      );
+    await drainExcept(t, isRetire);
+    expect((await parked(t)).some(isRetire)).toBe(true);
+    const mid = (await row()).paths.map((p: any) => p.rule);
+    expect(mid).toHaveLength(MAX_PATHS);
+    expect(mid).toContain(ORG_SQUAD.key);
+    await drain(t);
+    expect((await row()).paths.map((p: any) => p.rule)).toEqual([
+      ORG_SQUAD.key,
+    ]);
+    expect((await snapshot(t)).failures).toEqual([]);
+    await expectExact(t, [ORG_SQUAD], 16);
+  });
+});
+
+describe("the seed is in the caller transaction", () => {
+  test("a read later in the same mutation sees the fact and its mirror, and not after deleteFact", async () => {
+    const t = zbarEngineTest();
+    const config = graphConfig([TEAM, ORG], { writeBudget: 1 });
+    await t.run(async (ctx: any) => {
+      const env: Env = { config, configHash: "seed", budget: 1 };
+      const s = { type: "squad", id: "s1" };
+      const tm = { type: "team", id: "t1" };
+      const mirror = {
+        subjectKey: "squad:s1",
+        relation: "member",
+        objectKey: "team:t1",
+      };
+
+      await insertFact(ctx, env, {
+        subject: { type: "user", id: "u1" },
+        relation: "member",
+        object: s,
+      });
+      const { id, items } = await insertFact(ctx, env, {
+        subject: s,
+        relation: "member",
+        object: tm,
+      });
+      await execute(ctx, env, items);
+      expect(await findFact(ctx, s, "member", tm)).not.toBeNull();
+      expect((await findRow(ctx, mirror))?.paths).toEqual([
+        { baseIds: [id], rule: "fact" },
+      ]);
+
+      const fact = (await findFact(ctx, s, "member", tm))!;
+      await execute(ctx, env, (await deleteFact(ctx, fact)).items);
+      expect(await findFact(ctx, s, "member", tm)).toBeNull();
+      expect(await findRow(ctx, mirror)).toBeNull();
+    });
   });
 });

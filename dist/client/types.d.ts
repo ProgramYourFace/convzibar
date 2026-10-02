@@ -1,27 +1,19 @@
 import type { ObjectType as ConvexObjectType, PropertyValidators } from "convex/values";
-export type SchemaRelation = string | {
-    type: string;
-} | {
-    type: string;
-    reverse: string;
-} | Array<string | {
-    type: string;
-} | {
-    type: string;
-    reverse: string;
-}>;
+/** `materialize('group#devices')` — the same arm, kept as rows by the BFS. */
+export interface MaterializedArm {
+    materialize: string;
+}
+/**
+ * One arm of a relation as written in the schema: `'system_user'` facts,
+ * `'admin'` inherits, `'group#viewer'` expands, `'parent.admin'` walks,
+ * `'~device#parent'` inverse, or `materialize(arm)` of an expands or walks arm.
+ */
+export type SchemaArm = string | MaterializedArm;
 export interface EntityDefinition {
-    relations?: Record<string, SchemaRelation>;
-    permissions?: Record<string, Array<string>>;
+    relations?: Record<string, SchemaArm[]>;
+    /** Permission arms: the relation arms minus facts and `materialize`. */
+    permissions?: Record<string, string[]>;
     propertyValidators?: Record<string, PropertyValidators>;
-    /**
-     * Dot-path relations evaluated at read time instead of materialised at
-     * write time. See {@link EntityBuilder.readTimeRelation}.
-     */
-    readTimeRelations?: Array<{
-        derivedRelation: string;
-        dotPath: string;
-    }>;
 }
 export interface ZbarSchema {
     entities: Record<string, EntityDefinition>;
@@ -33,8 +25,8 @@ export type BuiltZbarSchema<Entities extends Record<string, {
 }>> = {
     entities: {
         [E in keyof Entities]: {
-            relations: Record<keyof Entities[E]["relations"] & string, SchemaRelation>;
-            permissions: Record<Entities[E]["permissions"] & string, Array<string>>;
+            relations: Record<keyof Entities[E]["relations"] & string, SchemaArm[]>;
+            permissions: Record<Entities[E]["permissions"] & string, string[]>;
             propertyValidators: Entities[E]["properties"];
         };
     };
@@ -61,7 +53,4 @@ export type EntityRelationProperties<Schema extends ZbarSchema, ObjType extends 
  * Returns `undefined` when no properties are declared.
  */
 export type ResolvedProperties<Schema extends ZbarSchema, OT extends keyof Schema["entities"] & string, Rel extends string> = EntityRelationProperties<Schema, OT, Rel> extends never ? undefined : EntityRelationProperties<Schema, OT, Rel>;
-export declare class PermissionError extends Error {
-    constructor(message: string);
-}
 //# sourceMappingURL=types.d.ts.map

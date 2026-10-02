@@ -7,16 +7,9 @@ export type ActionCtx = Pick<GenericActionCtx<GenericDataModel>, "runQuery" | "r
 export interface ZbarInternal {
     component: any;
     schema: ZbarSchema;
-    asyncWrites: boolean;
+    /** The compiled config (v2). Both the planner and the BFS read only this. */
     graphConfig: GraphConfig;
     /** Stable content hash of `graphConfig`; mutations ship this instead of the config. */
     configHash: string;
-    readTimeChainDepth: number;
-    /**
-     * Memoises both `permission → relations` and `relation → inherited relations`
-     * lookups, keyed by `${objectType}:${name}` and `rel_inh:${objectType}:${name}`
-     * respectively. Per-Zbar-instance.
-     */
-    permissionRelationsCache: Map<string, string[]>;
 }
 //# sourceMappingURL=internal.d.ts.map

@@ -1,44 +1,21 @@
-import type { PropertyValidators } from "convex/values";
+// Type-level arm shapes for the schema builder.
+//
+// Relation arms are plain strings at the type level: a facts arm may name an
+// entity declared later in the chain (entities resolve at compile time, not
+// in declaration order), so a template-literal union over the entities seen
+// so far would reject valid schemas. The compiler checks every name when the
+// schema is loaded. Permission arms never name an entity, so they keep a
+// cheap typed union that catches a misspelt inherited set at compile time.
 
-// Distributive helper: resolves relation keys for a target type, handling
-// self-referential entities (where Target = EntName) by looking up the
-// in-progress Relations instead of the not-yet-complete Entities record.
-export type TargetRelationKeys<
-  Target,
-  EntName extends string,
-  Relations,
-  Entities extends Record<string, { relations: Record<string, string>; permissions: string; properties: Record<string, PropertyValidators> }>,
-> = Target extends EntName
-  ? keyof Relations & string
-  : Target extends keyof Entities
-    ? keyof Entities[Target]["relations"] & string
-    : never;
+/** `'parent.admin'` — walk one of this entity's relations, then take a set there. */
+export type WalkArmString = `${string}.${string}`;
 
-// Resolves valid relation names on a target entity for reverse edge typing.
-// When Target is the entity currently being defined (EntName), uses Relations.
-// Otherwise, looks up the target's relations from the already-defined Entities.
-export type ReverseTargetRelations<
-  Target extends string,
-  EntName extends string,
-  Relations,
-  Entities extends Record<string, { relations: Record<string, string>; permissions: string; properties: Record<string, PropertyValidators> }>,
-> = Target extends EntName
-  ? keyof Relations & string
-  : Target extends keyof Entities
-    ? keyof Entities[Target]["relations"] & string
-    : never;
+/** `'group#viewer'` (expands) or `'~device#parent'` (inverse). */
+export type HashArmString = `${string}#${string}`;
 
-// Userset path: "entityType#relationName" (e.g. "group#admin").
-// Uses # to distinguish from traversal dot-paths ("relation.targetRelation").
-// For self-referential entities, we include RelName (the relation currently
-// being defined) alongside the already-defined Relations.
-export type EntityUsersetPath<
-  EntName extends string,
-  RelName extends string,
-  Relations,
-  Entities extends Record<string, { relations: Record<string, string>; permissions: string; properties: Record<string, PropertyValidators> }>,
-> = {
-  [E in (keyof Entities | EntName) & string]: E extends EntName
-    ? `${E}#${(keyof Relations | RelName) & string}`
-    : `${E}#${keyof Entities[E]["relations"] & string}`;
-}[(keyof Entities | EntName) & string];
+/** An arm accepted by `.permission()`: an inherited set, a walk, an expansion or an inverse. */
+export type PermissionArmString<Relations, Permissions extends string> =
+  | (keyof Relations & string)
+  | Permissions
+  | WalkArmString
+  | HashArmString;

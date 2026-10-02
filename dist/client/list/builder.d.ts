@@ -9,6 +9,9 @@ type ListResult = {
  * Internal implementation of the fluent list query builder. A single class
  * implements all builder interfaces; the TypeScript interfaces (in ./types.ts)
  * restrict which methods are visible at each step.
+ *
+ * A relation and a permission compile the same way (`planSet`): both are sets
+ * of arms, the permission merely unwritable.
  */
 export declare class ListQueryBuilder extends BaseListBuilder<ListResult> {
     private _via;
@@ -17,10 +20,10 @@ export declare class ListQueryBuilder extends BaseListBuilder<ListResult> {
         type: string;
         id: string;
     }): this;
-    via(...entities: Array<{
+    via(...entities: ({
         type: string;
         id: string;
-    } | null | undefined>): this;
+    } | null | undefined)[]): this;
     collect(ctx: QueryCtx | ActionCtx): Promise<ListResult[]>;
 }
 export {};

@@ -1,9 +1,5 @@
 import type { ActionCtx, QueryCtx } from "../internal";
-import type {
-  EntityPermissions,
-  EntityRelations,
-  ZbarSchema,
-} from "../types";
+import type { EntityPermissions, EntityRelations, ZbarSchema } from "../types";
 
 /** Result row from a direct relationship query. */
 export interface DirectRelationship {
@@ -21,15 +17,17 @@ export interface ListDirectInitial<Schema extends ZbarSchema> {
   object<OT extends keyof Schema["entities"] & string>(
     objectType: OT,
   ): ListDirectWithObjectType<Schema, OT>;
-  object<OT extends keyof Schema["entities"] & string>(
-    object: { type: OT; id: string },
-  ): ListDirectWithObjectInstance<Schema, OT>;
+  object<OT extends keyof Schema["entities"] & string>(object: {
+    type: OT;
+    id: string;
+  }): ListDirectWithObjectInstance<Schema, OT>;
   subject<ST extends keyof Schema["entities"] & string>(
     subjectType: ST,
   ): ListDirectSubjectOnly<Schema>;
-  subject<ST extends keyof Schema["entities"] & string>(
-    subject: { type: ST; id: string },
-  ): ListDirectSubjectOnly<Schema>;
+  subject<ST extends keyof Schema["entities"] & string>(subject: {
+    type: ST;
+    id: string;
+  }): ListDirectSubjectOnly<Schema>;
 }
 
 export interface ListDirectWithObjectType<
@@ -39,9 +37,10 @@ export interface ListDirectWithObjectType<
   subject<ST extends keyof Schema["entities"] & string>(
     subjectType: ST,
   ): ListDirectCollectable<Schema, OT>;
-  subject<ST extends keyof Schema["entities"] & string>(
-    subject: { type: ST; id: string },
-  ): ListDirectCollectable<Schema, OT>;
+  subject<ST extends keyof Schema["entities"] & string>(subject: {
+    type: ST;
+    id: string;
+  }): ListDirectCollectable<Schema, OT>;
   relation<R extends EntityRelations<Schema, OT>>(
     relation: R,
   ): ListDirectObjectFiltered<Schema, OT>;
@@ -59,9 +58,10 @@ export interface ListDirectWithObjectInstance<
   subject<ST extends keyof Schema["entities"] & string>(
     subjectType: ST,
   ): ListDirectCollectable<Schema, OT>;
-  subject<ST extends keyof Schema["entities"] & string>(
-    subject: { type: ST; id: string },
-  ): ListDirectCollectable<Schema, OT>;
+  subject<ST extends keyof Schema["entities"] & string>(subject: {
+    type: ST;
+    id: string;
+  }): ListDirectCollectable<Schema, OT>;
   relation<R extends EntityRelations<Schema, OT>>(
     relation: R,
   ): ListDirectObjectFiltered<Schema, OT>;
@@ -79,9 +79,10 @@ export interface ListDirectObjectFiltered<
   subject<ST extends keyof Schema["entities"] & string>(
     subjectType: ST,
   ): ListDirectCollectable<Schema, OT>;
-  subject<ST extends keyof Schema["entities"] & string>(
-    subject: { type: ST; id: string },
-  ): ListDirectCollectable<Schema, OT>;
+  subject<ST extends keyof Schema["entities"] & string>(subject: {
+    type: ST;
+    id: string;
+  }): ListDirectCollectable<Schema, OT>;
   map<T>(fn: (item: DirectRelationship) => T | Promise<T>): ListDirectMapped<T>;
   collect(ctx: QueryCtx | ActionCtx): Promise<DirectRelationship[]>;
 }
@@ -90,9 +91,10 @@ export interface ListDirectSubjectOnly<Schema extends ZbarSchema> {
   object<OT extends keyof Schema["entities"] & string>(
     objectType: OT,
   ): ListDirectCollectable<Schema, OT>;
-  object<OT extends keyof Schema["entities"] & string>(
-    object: { type: OT; id: string },
-  ): ListDirectCollectable<Schema, OT>;
+  object<OT extends keyof Schema["entities"] & string>(object: {
+    type: OT;
+    id: string;
+  }): ListDirectCollectable<Schema, OT>;
   map<T>(fn: (item: DirectRelationship) => T | Promise<T>): ListDirectMapped<T>;
   collect(ctx: QueryCtx | ActionCtx): Promise<DirectRelationship[]>;
 }
@@ -101,9 +103,7 @@ export interface ListDirectCollectable<
   Schema extends ZbarSchema,
   OT extends keyof Schema["entities"] & string,
 > {
-  relation<R extends EntityRelations<Schema, OT>>(
-    relation: R,
-  ): ListDirectFinal;
+  relation<R extends EntityRelations<Schema, OT>>(relation: R): ListDirectFinal;
   permission<P extends EntityPermissions<Schema, OT>>(
     permission: P,
   ): ListDirectFinal;

@@ -1,9 +1,7 @@
+import { zbarEngineTest } from "../../test";
 import { expect, test, describe } from "vitest";
-import { convexTest } from "convex-test";
-import { Zbar, createZbarSchema } from "../index.js";
-import schema from "../../component/schema.js";
-import { api } from "../../component/_generated/api.js";
-import { register as registerWorkpool } from "@convex-dev/workpool/test";
+import { Zbar, createZbarSchema } from "../index";
+import { api } from "../../component/_generated/api";
 
 // ============================================================================
 // Compiled-config registry (configs table + configHash on every write).
@@ -17,11 +15,7 @@ import { register as registerWorkpool } from "@convex-dev/workpool/test";
 // recovery from a stale flag.
 // ============================================================================
 
-const setup = () => {
-  const t = convexTest(schema, import.meta.glob("../../component/**/*.ts"));
-  registerWorkpool(t, "workpool");
-  return t;
-};
+const setup = zbarEngineTest;
 
 const zbarSchema = createZbarSchema()
   .entity("user")
@@ -39,7 +33,7 @@ const mkCtx = (t: any) =>
     runMutation: t.mutation.bind(t),
   }) as any;
 
-const mkZbar = () => new Zbar(api, { schema: zbarSchema, asyncWrites: false });
+const mkZbar = () => new Zbar(api, { schema: zbarSchema });
 
 const u1 = { type: "user", id: "u1" } as const;
 const u2 = { type: "user", id: "u2" } as const;
@@ -114,18 +108,5 @@ describe("compiled-config registry", () => {
     await zbar.removeRelation(ctx, u2, "admin", org);
     expect(await zbar.can(ctx, u2, "manage", org)).toBe(false);
     expect(await configRows(t)).toHaveLength(1);
-  });
-
-  test("configHash is stable across instances and sensitive to options", async () => {
-    const sameA = mkZbar();
-    const sameB = mkZbar();
-    expect(sameA.configHash).toBe(sameB.configHash);
-
-    const deeper = new Zbar(api, {
-      schema: zbarSchema,
-      asyncWrites: false,
-      maxWriteDepth: 7,
-    });
-    expect(deeper.configHash).not.toBe(sameA.configHash);
   });
 });

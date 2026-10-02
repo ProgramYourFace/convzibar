@@ -1,52 +1,91 @@
 import { BaseListBuilder } from "../list/base";
-import { resolvePermissionRelations, resolveRelationInheritance, } from "../zbar/resolvers";
+import { resolveFactRelations, resolveRelationInheritance, } from "../zbar/resolvers";
+import { readFactsForward, readFactsReverse } from "../zbar/traversal";
 /**
  * Internal implementation of the fluent direct-relationship query builder.
+ *
+ * `listDirect()` returns FACTS, never reach (CONTRACT §3). A `.relation(r)` or
+ * `.permission(p)` filter reads the writable members of the set's inherits
+ * closure (`factRelations`). A set with inverse arms (`~T#r`) has no facts of
+ * its own; its members are facts `(o, r, x)` read backwards, so they are
+ * returned flipped: `{ subject: x, relation: <the set>, object: o }`, with the
+ * underlying fact's properties.
  */
 export class ListDirectQueryBuilder extends BaseListBuilder {
     async collect(ctx) {
         const z = this.z;
+        const config = z.graphConfig;
         const objectType = this._objectType;
-        // 1. Determine which relations to filter for.
-        let filterRelations;
-        if (this._permission && objectType) {
-            // Permission → expand to all relations that satisfy it (including inherited).
-            filterRelations = resolvePermissionRelations(z, objectType, this._permission);
-        }
-        else if (this._relation && objectType) {
-            // Relation → expand with inheritance.
-            filterRelations = resolveRelationInheritance(z, objectType, this._relation);
-        }
-        // 2. Build the query args.
-        const subjectArg = this._subjectType && this._subjectId
+        const setName = this._relation ?? this._permission;
+        const subject = this._subjectType && this._subjectId
             ? { type: this._subjectType, id: this._subjectId }
             : undefined;
-        const objectArg = this._objectType && this._objectId
-            ? { type: this._objectType, id: this._objectId }
+        const object = objectType && this._objectId
+            ? { type: objectType, id: this._objectId }
             : undefined;
-        // 3. Query base relationships from the component.
-        // Pass type-only filters server-side to minimise data transfer
-        // and leverage deeper index prefixes where possible.
-        const rows = await ctx.runQuery(z.component.queries.listDirectRelationships, {
-            subject: subjectArg,
-            object: objectArg,
-            relations: filterRelations,
-            filterSubjectType: this._subjectType && !this._subjectId
-                ? this._subjectType
-                : undefined,
-            filterObjectType: this._objectType && !this._objectId
-                ? this._objectType
-                : undefined,
-        });
-        // 4. Map to result shape.
-        const results = rows.map((r) => ({
-            subject: { type: r.subjectType, id: r.subjectId },
-            relation: r.relation,
-            object: { type: r.objectType, id: r.objectId },
-            properties: r.properties,
-        }));
-        // 5. Apply user-provided mapper in parallel if present.
-        return this._applyMap(results);
+        // No set named: every fact at the anchor(s).
+        if (!setName || !objectType) {
+            const rows = await ctx.runQuery(z.component.queries.listDirectRelationships, {
+                subject,
+                object,
+                filterSubjectType: this._subjectType && !this._subjectId
+                    ? this._subjectType
+                    : undefined,
+                filterObjectType: objectType && !this._objectId ? objectType : undefined,
+            });
+            return this._applyMap(rows.map(toDirect));
+        }
+        const closure = resolveRelationInheritance(z, objectType, setName);
+        const factRelations = resolveFactRelations(z, objectType, setName);
+        const reads = [];
+        if (factRelations.length > 0) {
+            reads.push(ctx
+                .runQuery(z.component.queries.listDirectRelationships, {
+                subject,
+                object,
+                relations: factRelations,
+                filterSubjectType: this._subjectType && !this._subjectId
+                    ? this._subjectType
+                    : undefined,
+                filterObjectType: !this._objectId ? objectType : undefined,
+            })
+                .then((rows) => rows.map(toDirect)));
+        }
+        // Inverse arms: one facts range per arm, anchored on whichever end is pinned.
+        for (const member of closure) {
+            for (const arm of config.sets[objectType]?.[member]?.arms ?? []) {
+                if (arm.kind !== "inverse")
+                    continue;
+                if (this._subjectType && this._subjectType !== arm.subjectType)
+                    continue;
+                const flip = (o, x, properties) => ({
+                    subject: { type: arm.subjectType, id: x },
+                    relation: member,
+                    object: { type: objectType, id: o },
+                    properties,
+                });
+                if (object) {
+                    reads.push(readFactsForward(z, ctx, [object], [arm.relation], {
+                        type: arm.subjectType,
+                        ids: subject ? [subject.id] : undefined,
+                    }).then((rows) => rows.map((r) => flip(r.subjectId, r.objectId, r.properties))));
+                }
+                else if (subject) {
+                    reads.push(readFactsReverse(z, ctx, [subject], [arm.relation], {
+                        type: objectType,
+                    }).then((rows) => rows.map((r) => flip(r.subjectId, r.objectId, r.properties))));
+                }
+            }
+        }
+        return this._applyMap((await Promise.all(reads)).flat());
     }
+}
+function toDirect(r) {
+    return {
+        subject: { type: r.subjectType, id: r.subjectId },
+        relation: r.relation,
+        object: { type: r.objectType, id: r.objectId },
+        properties: r.properties,
+    };
 }
 //# sourceMappingURL=builder.js.map

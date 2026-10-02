@@ -1,29 +1,19 @@
-import { expandRelationTargets } from "../../shared/relation-def";
+// Reads of the closures the compiler precomputed (`GraphConfig.inherits`,
+// `GraphConfig.factRelations`), so local inheritance can never be derived two
+// different ways.
 /**
- * Expand a permission name into the full set of relations that satisfy it on a
- * given object type, walking userset rewrites recursively. Memoised.
+ * `set` plus every set it transitively inherits (CONTRACT §2.4), e.g. `owner`
+ * → `[owner, admin, viewer]` when `owner` inherits `admin` inherits `viewer`.
+ * Relations and permissions are both sets. Empty for an unknown name.
  */
-export function resolvePermissionRelations(z, objectType, permission) {
-    const cacheKey = `${objectType}:${permission}`;
-    const cached = z.permissionRelationsCache.get(cacheKey);
-    if (cached)
-        return cached;
-    const perms = z.schema.entities[objectType]?.permissions?.[permission] || [];
-    const results = expandRelationTargets(z.schema, objectType, perms);
-    z.permissionRelationsCache.set(cacheKey, results);
-    return results;
+export function resolveRelationInheritance(z, objectType, set) {
+    return z.graphConfig.inherits[objectType]?.[set] ?? [];
 }
 /**
- * Expand a relation into itself plus all relations it transitively contains via
- * local userset rewrites (e.g. `owner` → `[owner, admin, viewer]`). Memoised.
+ * The writable relations in `set`'s closure: what a first hop through `set`
+ * reads facts of (CONTRACT §2.1).
  */
-export function resolveRelationInheritance(z, objectType, relation) {
-    const cacheKey = `rel_inh:${objectType}:${relation}`;
-    const cached = z.permissionRelationsCache.get(cacheKey);
-    if (cached)
-        return cached;
-    const results = expandRelationTargets(z.schema, objectType, [relation]);
-    z.permissionRelationsCache.set(cacheKey, results);
-    return results;
+export function resolveFactRelations(z, objectType, set) {
+    return z.graphConfig.factRelations[objectType]?.[set] ?? [];
 }
 //# sourceMappingURL=resolvers.js.map

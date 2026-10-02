@@ -1,37 +1,43 @@
 import { CONFIG_UNREGISTERED_MARKER } from "../../component/config";
-import { parseSchemaToGraphConfig } from "../../component/helpers";
+import { fnv1a, parseSchemaToGraphConfig } from "../../component/helpers";
 import type { GraphConfig } from "../../component/types";
-import type { ZbarInternal, ActionCtx, MutationCtx, QueryCtx } from "../internal";
+import type {
+  ZbarInternal,
+  ActionCtx,
+  MutationCtx,
+  QueryCtx,
+} from "../internal";
 import type {
   EntityPermissions,
   EntityRelations,
   ResolvedProperties,
   ZbarSchema,
 } from "../types";
-import { PermissionError } from "../types";
 import { ListDirectQueryBuilder } from "../list-direct/builder";
 import type { ListDirectInitial } from "../list-direct/types";
 import { ListQueryBuilder } from "../list/builder";
 import type { ListInitial } from "../list/types";
-import {
-  resolvePermissionRelations,
-  resolveRelationInheritance,
-} from "./resolvers";
-import { evaluateManyPermissions, planRelation } from "./traversal";
-import {
-  validateProperties,
-  validateRelationParameter,
-} from "./validation";
+import { evaluateManyPermissions, planSet } from "./traversal";
+import { validateProperties, validateRelationParameter } from "./validation";
 
-export interface ZbarOptions<Schema extends ZbarSchema> {
+/** CONTRACT.md §6. */
+interface ZbarOptions<Schema extends ZbarSchema> {
   schema: Schema;
-  maxWriteDepth?: number;
-  asyncWrites?: boolean;
   /**
-   * Maximum recursion depth for chained read-time-relation evaluation.
-   * Defaults to 3. Set to 0 to disable chaining (a single RT hop still works).
+   * Budget units one transaction may spend materializing (about one row
+   * written each) before the rest continues in the workpool from a cursor.
+   * The fact and its mirror are always written in the caller's transaction.
+   * Defaults to 1000.
    */
-  readTimeChainDepth?: number;
+  writeBudget?: number;
+  /**
+   * The most facts one derivation may use, on both sides (CONTRACT §4.7). A
+   * write never stores a longer path and records an `expansionFailures` row;
+   * a recursive read throws when the hit it finds needs a longer one. An
+   * acyclic chain longer than this is a schema error at construction.
+   * Defaults to 16.
+   */
+  maxDepth?: number;
 }
 
 // ---------------------------------------------------------------------------
@@ -43,16 +49,11 @@ function stableStringify(v: any): string {
   if (v === null || typeof v !== "object") return JSON.stringify(v);
   if (Array.isArray(v)) return "[" + v.map(stableStringify).join(",") + "]";
   const keys = Object.keys(v).sort();
-  return "{" + keys.map((k) => JSON.stringify(k) + ":" + stableStringify(v[k])).join(",") + "}";
-}
-
-function fnv1a(s: string, seed: number): string {
-  let h = seed >>> 0;
-  for (let i = 0; i < s.length; i++) {
-    h ^= s.charCodeAt(i);
-    h = Math.imul(h, 0x01000193);
-  }
-  return (h >>> 0).toString(16).padStart(8, "0");
+  return (
+    "{" +
+    keys.map((k) => JSON.stringify(k) + ":" + stableStringify(v[k])).join(",") +
+    "}"
+  );
 }
 
 function hashGraphConfig(config: GraphConfig): string {
@@ -87,27 +88,23 @@ export class Zbar<Schema extends ZbarSchema> {
     public component: any,
     private options: ZbarOptions<Schema>,
   ) {
-    const graphConfig = parseSchemaToGraphConfig(options.schema);
-    if (options.maxWriteDepth !== undefined) {
-      graphConfig.maxWriteDepth = options.maxWriteDepth;
-    }
-    this.options.asyncWrites = options.asyncWrites ?? true;
-
+    // The limits are part of the config the component stores and the BFS
+    // obeys, so they are compiled in (and hashed).
+    const graphConfig = parseSchemaToGraphConfig(options.schema, {
+      maxDepth: options.maxDepth,
+      writeBudget: options.writeBudget,
+    });
     this._internal = {
       component,
       schema: options.schema,
-      asyncWrites: this.options.asyncWrites,
       graphConfig,
       configHash: hashGraphConfig(graphConfig),
-      readTimeChainDepth: options.readTimeChainDepth ?? 3,
-      permissionRelationsCache: new Map(),
     };
   }
 
   /**
    * The compiled graph configuration. Exposed for advanced use cases and a
-   * handful of tests that inspect or tweak runtime parameters such as
-   * `maxChunkSize` or `mockWorkpool`.
+   * handful of tests that inspect it or set `mockWorkpool`.
    */
   get graphConfig() {
     return this._internal.graphConfig;
@@ -131,10 +128,11 @@ export class Zbar<Schema extends ZbarSchema> {
     relation: Relation,
     object: { type: ObjectType; id: string },
   ): Promise<boolean> {
-    const z = this._internal;
-    const targets = resolveRelationInheritance(z, object.type, relation);
-    if (targets.length === 0) return false;
-    return planRelation(z, object.type, targets).check(ctx, subject, object);
+    return planSet(this._internal, object.type, relation).check(
+      ctx,
+      subject,
+      object,
+    );
   }
 
   async can<
@@ -147,16 +145,17 @@ export class Zbar<Schema extends ZbarSchema> {
     permission: Permission,
     object: { type: ObjectType; id: string },
   ): Promise<boolean> {
-    const z = this._internal;
-    const targets = resolvePermissionRelations(z, object.type, permission);
-    if (targets.length === 0) return false;
-    return planRelation(z, object.type, targets).check(ctx, subject, object);
+    return planSet(this._internal, object.type, permission).check(
+      ctx,
+      subject,
+      object,
+    );
   }
 
   /**
-   * Return every permission the subject currently holds on the object,
-   * resolved in one materialised query plus at most one shared RT branch per
-   * unique derived relation. Declaration order is preserved.
+   * Every permission the subject holds on the object, in declaration order:
+   * one batched read of every permission's materialised members, then each
+   * distinct remaining branch at most once.
    */
   async getPermissions<
     SubjectType extends keyof Schema["entities"] & string,
@@ -165,40 +164,22 @@ export class Zbar<Schema extends ZbarSchema> {
     ctx: QueryCtx | ActionCtx,
     subject: { type: SubjectType; id: string },
     object: { type: ObjectType; id: string },
-  ): Promise<Array<EntityPermissions<Schema, ObjectType>>> {
+  ): Promise<EntityPermissions<Schema, ObjectType>[]> {
     const z = this._internal;
+    // Declaration order comes from the schema; the compiled config sorts its keys.
+    const sets = z.graphConfig.sets[object.type] ?? {};
     const permissions = Object.keys(
-      z.schema.entities[object.type]?.permissions || {},
-    ) as Array<EntityPermissions<Schema, ObjectType>>;
+      z.schema.entities[object.type]?.permissions ?? {},
+    ).filter((name) => sets[name] && !sets[name].writable);
     if (permissions.length === 0) return [];
-
-    const perms = permissions.map((permission) => ({
-      permission: permission as string,
-      targets: resolvePermissionRelations(z, object.type, permission),
-    }));
-    const granted = await evaluateManyPermissions(z, ctx, subject, object, perms);
-    return granted as Array<EntityPermissions<Schema, ObjectType>>;
-  }
-
-  /**
-   * Asserts that a subject has a permission on an object, throwing a
-   * PermissionError if denied.
-   */
-  async require<
-    SubjectType extends keyof Schema["entities"] & string,
-    ObjectType extends keyof Schema["entities"] & string,
-    Permission extends EntityPermissions<Schema, ObjectType>,
-  >(
-    ctx: QueryCtx | ActionCtx,
-    subject: { type: SubjectType; id: string },
-    permission: Permission,
-    object: { type: ObjectType; id: string },
-  ): Promise<void> {
-    if (!(await this.can(ctx, subject, permission, object))) {
-      throw new PermissionError(
-        `Permission denied: ${permission} on ${object.type}:${object.id}`,
-      );
-    }
+    const granted = await evaluateManyPermissions(
+      z,
+      ctx,
+      subject,
+      object,
+      permissions,
+    );
+    return granted as EntityPermissions<Schema, ObjectType>[];
   }
 
   /** Fluent query builder for listing objects or subjects. */
@@ -234,7 +215,6 @@ export class Zbar<Schema extends ZbarSchema> {
         ...payload,
         configHash: z.configHash,
         graphConfig: withConfig ? z.graphConfig : undefined,
-        asyncWrites: z.asyncWrites,
       });
 
     let result;
@@ -266,7 +246,11 @@ export class Zbar<Schema extends ZbarSchema> {
     relation: Relation,
     object: { type: ObjectType; id: string },
     options?: {
-      properties?: ResolvedProperties<Schema, ObjectType, Relation & string> extends undefined
+      properties?: ResolvedProperties<
+        Schema,
+        ObjectType,
+        Relation & string
+      > extends undefined
         ? never
         : ResolvedProperties<Schema, ObjectType, Relation & string>;
     },
@@ -286,43 +270,6 @@ export class Zbar<Schema extends ZbarSchema> {
   }
 
   /**
-   * Update a relationship to a new relation, executed atomically via
-   * Add-Before-Remove.
-   */
-  async updateRelation<
-    SubjectType extends keyof Schema["entities"] & string,
-    ObjectType extends keyof Schema["entities"] & string,
-    OldRelation extends EntityRelations<Schema, ObjectType>,
-    NewRelation extends EntityRelations<Schema, ObjectType>,
-  >(
-    ctx: MutationCtx | ActionCtx,
-    subject: { type: SubjectType; id: string },
-    oldRelation: OldRelation,
-    newRelation: NewRelation,
-    object: { type: ObjectType; id: string },
-    options?: {
-      properties?: ResolvedProperties<Schema, ObjectType, NewRelation & string> extends undefined
-        ? never
-        : ResolvedProperties<Schema, ObjectType, NewRelation & string>;
-    },
-  ): Promise<string> {
-    const z = this._internal;
-    validateRelationParameter(z, subject, oldRelation as string, object);
-    validateRelationParameter(z, subject, newRelation as string, object);
-    if (options?.properties !== undefined) {
-      validateProperties(z, object.type, newRelation as string, options.properties);
-    }
-
-    return this._runWrite(ctx, this.component.mutations.updateRelation, {
-      subject,
-      oldRelation,
-      newRelation,
-      object,
-      properties: options?.properties,
-    });
-  }
-
-  /**
    * Add a relationship, clearing any existing relationships between the
    * subject and object atomically.
    */
@@ -336,7 +283,11 @@ export class Zbar<Schema extends ZbarSchema> {
     relation: Relation,
     object: { type: ObjectType; id: string },
     options?: {
-      properties?: ResolvedProperties<Schema, ObjectType, Relation & string> extends undefined
+      properties?: ResolvedProperties<
+        Schema,
+        ObjectType,
+        Relation & string
+      > extends undefined
         ? never
         : ResolvedProperties<Schema, ObjectType, Relation & string>;
     },
@@ -347,9 +298,9 @@ export class Zbar<Schema extends ZbarSchema> {
       validateProperties(z, object.type, relation, options.properties);
     }
 
-    const objectRelations = Object.keys(
-      z.schema.entities[object.type]?.relations || {},
-    );
+    const objectRelations = Object.values(z.graphConfig.sets[object.type] ?? {})
+      .filter((set) => set.writable)
+      .map((set) => set.name);
 
     return this._runWrite(ctx, this.component.mutations.setRelation, {
       subject,
@@ -391,6 +342,51 @@ export class Zbar<Schema extends ZbarSchema> {
   }> {
     return this._runWrite(ctx, this.component.mutations.deleteEntity, {
       entity,
+    });
+  }
+
+  // -------------------------------------------------------------------------
+  // Materialization maintenance (CONTRACT.md §5.6–5.7).
+  // -------------------------------------------------------------------------
+
+  /**
+   * Re-derive every materialized row under this instance's config, then
+   * retire every path it does not justify (CONTRACT §5.6). The component also
+   * enqueues this itself whenever a write changes the active config (a new
+   * hash after a deploy, or a rollback to an earlier one), so neither needs a
+   * call. Idempotent and resumable; the work continues in the workpool by
+   * cursor.
+   */
+  async rebuild(ctx: MutationCtx | ActionCtx): Promise<unknown> {
+    return this._runWrite(ctx, this.component.mutations.rebuild, {});
+  }
+
+  /** Expansion chunks that gave up, derivations past `maxDepth`, and paths a full row refused, newest first. */
+  async listExpansionFailures(
+    ctx: QueryCtx | ActionCtx,
+    options?: { limit?: number },
+  ): Promise<
+    {
+      _id: string;
+      reason: "failed" | "canceled" | "depth" | "paths";
+      error: string;
+      attempts: number;
+      createdAt: number;
+      cursor: unknown;
+    }[]
+  > {
+    return ctx.runQuery(this.component.queries.listExpansionFailures, {
+      limit: options?.limit,
+    });
+  }
+
+  /** Re-enqueue a recorded failure's cursor unchanged. */
+  async resumeExpansion(
+    ctx: MutationCtx | ActionCtx,
+    failureId: string,
+  ): Promise<unknown> {
+    return ctx.runMutation(this.component.mutations.resumeExpansion, {
+      failureId,
     });
   }
 }

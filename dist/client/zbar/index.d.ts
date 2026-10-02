@@ -3,15 +3,24 @@ import type { ActionCtx, MutationCtx, QueryCtx } from "../internal";
 import type { EntityPermissions, EntityRelations, ResolvedProperties, ZbarSchema } from "../types";
 import type { ListDirectInitial } from "../list-direct/types";
 import type { ListInitial } from "../list/types";
-export interface ZbarOptions<Schema extends ZbarSchema> {
+/** CONTRACT.md §6. */
+interface ZbarOptions<Schema extends ZbarSchema> {
     schema: Schema;
-    maxWriteDepth?: number;
-    asyncWrites?: boolean;
     /**
-     * Maximum recursion depth for chained read-time-relation evaluation.
-     * Defaults to 3. Set to 0 to disable chaining (a single RT hop still works).
+     * Budget units one transaction may spend materializing (about one row
+     * written each) before the rest continues in the workpool from a cursor.
+     * The fact and its mirror are always written in the caller's transaction.
+     * Defaults to 1000.
      */
-    readTimeChainDepth?: number;
+    writeBudget?: number;
+    /**
+     * The most facts one derivation may use, on both sides (CONTRACT §4.7). A
+     * write never stores a longer path and records an `expansionFailures` row;
+     * a recursive read throws when the hit it finds needs a longer one. An
+     * acyclic chain longer than this is a schema error at construction.
+     * Defaults to 16.
+     */
+    maxDepth?: number;
 }
 /**
  * Create a new Zbar client instance.
@@ -26,8 +35,7 @@ export declare class Zbar<Schema extends ZbarSchema> {
     constructor(component: any, options: ZbarOptions<Schema>);
     /**
      * The compiled graph configuration. Exposed for advanced use cases and a
-     * handful of tests that inspect or tweak runtime parameters such as
-     * `maxChunkSize` or `mockWorkpool`.
+     * handful of tests that inspect it or set `mockWorkpool`.
      */
     get graphConfig(): GraphConfig;
     /** Stable content hash of the compiled config (mutations ship this). */
@@ -50,9 +58,9 @@ export declare class Zbar<Schema extends ZbarSchema> {
         id: string;
     }): Promise<boolean>;
     /**
-     * Return every permission the subject currently holds on the object,
-     * resolved in one materialised query plus at most one shared RT branch per
-     * unique derived relation. Declaration order is preserved.
+     * Every permission the subject holds on the object, in declaration order:
+     * one batched read of every permission's materialised members, then each
+     * distinct remaining branch at most once.
      */
     getPermissions<SubjectType extends keyof Schema["entities"] & string, ObjectType extends keyof Schema["entities"] & string>(ctx: QueryCtx | ActionCtx, subject: {
         type: SubjectType;
@@ -60,18 +68,7 @@ export declare class Zbar<Schema extends ZbarSchema> {
     }, object: {
         type: ObjectType;
         id: string;
-    }): Promise<Array<EntityPermissions<Schema, ObjectType>>>;
-    /**
-     * Asserts that a subject has a permission on an object, throwing a
-     * PermissionError if denied.
-     */
-    require<SubjectType extends keyof Schema["entities"] & string, ObjectType extends keyof Schema["entities"] & string, Permission extends EntityPermissions<Schema, ObjectType>>(ctx: QueryCtx | ActionCtx, subject: {
-        type: SubjectType;
-        id: string;
-    }, permission: Permission, object: {
-        type: ObjectType;
-        id: string;
-    }): Promise<void>;
+    }): Promise<EntityPermissions<Schema, ObjectType>[]>;
     /** Fluent query builder for listing objects or subjects. */
     list(): ListInitial<Schema>;
     /** Fluent query builder for listing **direct** (base) relationships. */
@@ -103,19 +100,6 @@ export declare class Zbar<Schema extends ZbarSchema> {
         properties?: ResolvedProperties<Schema, ObjectType, Relation & string> extends undefined ? never : ResolvedProperties<Schema, ObjectType, Relation & string>;
     }): Promise<string>;
     /**
-     * Update a relationship to a new relation, executed atomically via
-     * Add-Before-Remove.
-     */
-    updateRelation<SubjectType extends keyof Schema["entities"] & string, ObjectType extends keyof Schema["entities"] & string, OldRelation extends EntityRelations<Schema, ObjectType>, NewRelation extends EntityRelations<Schema, ObjectType>>(ctx: MutationCtx | ActionCtx, subject: {
-        type: SubjectType;
-        id: string;
-    }, oldRelation: OldRelation, newRelation: NewRelation, object: {
-        type: ObjectType;
-        id: string;
-    }, options?: {
-        properties?: ResolvedProperties<Schema, ObjectType, NewRelation & string> extends undefined ? never : ResolvedProperties<Schema, ObjectType, NewRelation & string>;
-    }): Promise<string>;
-    /**
      * Add a relationship, clearing any existing relationships between the
      * subject and object atomically.
      */
@@ -144,5 +128,28 @@ export declare class Zbar<Schema extends ZbarSchema> {
         relationshipsRemoved: number;
         effectiveRelationshipsRemoved: number;
     }>;
+    /**
+     * Re-derive every materialized row under this instance's config, then
+     * retire every path it does not justify (CONTRACT §5.6). The component also
+     * enqueues this itself whenever a write changes the active config (a new
+     * hash after a deploy, or a rollback to an earlier one), so neither needs a
+     * call. Idempotent and resumable; the work continues in the workpool by
+     * cursor.
+     */
+    rebuild(ctx: MutationCtx | ActionCtx): Promise<unknown>;
+    /** Expansion chunks that gave up, derivations past `maxDepth`, and paths a full row refused, newest first. */
+    listExpansionFailures(ctx: QueryCtx | ActionCtx, options?: {
+        limit?: number;
+    }): Promise<{
+        _id: string;
+        reason: "failed" | "canceled" | "depth" | "paths";
+        error: string;
+        attempts: number;
+        createdAt: number;
+        cursor: unknown;
+    }[]>;
+    /** Re-enqueue a recorded failure's cursor unchanged. */
+    resumeExpansion(ctx: MutationCtx | ActionCtx, failureId: string): Promise<unknown>;
 }
+export {};
 //# sourceMappingURL=index.d.ts.map

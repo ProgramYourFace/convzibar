@@ -1,19 +1,7 @@
-import type { PropertyValidators } from "convex/values";
-export type TargetRelationKeys<Target, EntName extends string, Relations, Entities extends Record<string, {
-    relations: Record<string, string>;
-    permissions: string;
-    properties: Record<string, PropertyValidators>;
-}>> = Target extends EntName ? keyof Relations & string : Target extends keyof Entities ? keyof Entities[Target]["relations"] & string : never;
-export type ReverseTargetRelations<Target extends string, EntName extends string, Relations, Entities extends Record<string, {
-    relations: Record<string, string>;
-    permissions: string;
-    properties: Record<string, PropertyValidators>;
-}>> = Target extends EntName ? keyof Relations & string : Target extends keyof Entities ? keyof Entities[Target]["relations"] & string : never;
-export type EntityUsersetPath<EntName extends string, RelName extends string, Relations, Entities extends Record<string, {
-    relations: Record<string, string>;
-    permissions: string;
-    properties: Record<string, PropertyValidators>;
-}>> = {
-    [E in (keyof Entities | EntName) & string]: E extends EntName ? `${E}#${(keyof Relations | RelName) & string}` : `${E}#${keyof Entities[E]["relations"] & string}`;
-}[(keyof Entities | EntName) & string];
+/** `'parent.admin'` — walk one of this entity's relations, then take a set there. */
+export type WalkArmString = `${string}.${string}`;
+/** `'group#viewer'` (expands) or `'~device#parent'` (inverse). */
+export type HashArmString = `${string}#${string}`;
+/** An arm accepted by `.permission()`: an inherited set, a walk, an expansion or an inverse. */
+export type PermissionArmString<Relations, Permissions extends string> = (keyof Relations & string) | Permissions | WalkArmString | HashArmString;
 //# sourceMappingURL=builder-types.d.ts.map

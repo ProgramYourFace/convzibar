@@ -1,9 +1,5 @@
 import type { ActionCtx, QueryCtx } from "../internal";
-import type {
-  EntityPermissions,
-  EntityRelations,
-  ZbarSchema,
-} from "../types";
+import type { EntityPermissions, EntityRelations, ZbarSchema } from "../types";
 
 /**
  * Entry point returned by `zbar.list()`. Call `.object()` to begin building
@@ -16,9 +12,10 @@ export interface ListInitial<Schema extends ZbarSchema> {
   object<OT extends keyof Schema["entities"] & string>(
     objectType: OT,
   ): ListWithObjectType<Schema, OT>;
-  object<OT extends keyof Schema["entities"] & string>(
-    object: { type: OT; id: string },
-  ): ListWithObjectInstance<Schema, OT>;
+  object<OT extends keyof Schema["entities"] & string>(object: {
+    type: OT;
+    id: string;
+  }): ListWithObjectInstance<Schema, OT>;
 }
 
 /** After `.object(type)` — listing objects. Pick a relation or permission. */
@@ -49,9 +46,10 @@ export interface ListWithObjectInstance<
 
 /** Listing objects — subject must be a full `{type, id}` pair. */
 export interface ListObjectsNeedSubject<Schema extends ZbarSchema> {
-  subject<ST extends keyof Schema["entities"] & string>(
-    subject: { type: ST; id: string },
-  ): ListCollectable<Schema, { objectId: string }>;
+  subject<ST extends keyof Schema["entities"] & string>(subject: {
+    type: ST;
+    id: string;
+  }): ListCollectable<Schema, { objectId: string }>;
 }
 
 /** Listing subjects — subject is just a type string. */
@@ -64,7 +62,7 @@ export interface ListSubjectsNeedSubject<Schema extends ZbarSchema> {
 /** Ready to collect, with optional `.via()` filtering and `.map()`. */
 export interface ListCollectable<Schema extends ZbarSchema, Result> {
   via<VT extends keyof Schema["entities"] & string>(
-    ...entities: Array<{ type: VT; id: string } | null | undefined>
+    ...entities: ({ type: VT; id: string } | null | undefined)[]
   ): ListFinal<Result>;
   map<T>(fn: (item: Result) => T | Promise<T>): ListMapped<T>;
   collect(ctx: QueryCtx | ActionCtx): Promise<Result[]>;

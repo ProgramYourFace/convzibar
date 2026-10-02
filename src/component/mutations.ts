@@ -1,101 +1,286 @@
+/**
+ * Write entry points of the engine (EXPANSION.md §2.9). Every public mutation
+ * loads the config (registering it on first use) and makes it the active
+ * config (`envOf`; a change owes a `rebuild`), runs the seed in the caller's
+ * transaction (`insertFact` / `deleteFact` in expand.ts), and hands its items
+ * to `execute`, which runs what fits the budget, depth-first; what is left is
+ * enqueued as ONE continuation on `expansionPool` (`executeAndContinue`).
+ */
+
+import { vOnCompleteArgs } from "@convex-dev/workpool";
 import { v } from "convex/values";
-import { buildScopeKey } from "../shared/keys";
 import { internal } from "./_generated/api";
-import { internalMutation, mutation } from "./_generated/server";
-import { loadConfig } from "./config";
-import { applyTraversalRulesToItem, collectRuleDerivations } from "./expand";
-import { canonicalizePath, pathKey } from "./paths";
-import { runOrEnqueue } from "./runOrEnqueue";
+import {
+  internalMutation,
+  internalQuery,
+  mutation,
+  type MutationCtx,
+} from "./_generated/server";
+import {
+  activateConfig,
+  activeConfigHash,
+  ensureConfig,
+  limitsOf,
+  loadConfig,
+} from "./config";
+import {
+  type Cursor,
+  type Env,
+  type Stats,
+  type WorkItem,
+  deleteFact,
+  execute,
+  findFact,
+  insertFact,
+  parseCursor,
+} from "./expand";
 import type { GraphConfig } from "./types";
 import {
   objectValidator,
   propertiesValidator,
   subjectValidator,
 } from "./validators";
+import { expansionPool } from "./workpool";
 
-type Entity = { type: string; id: string };
+/** Attempts of one cursor before it is recorded in `expansionFailures` (CONTRACT §5.7). */
+export const MAX_ATTEMPTS = 5;
 
-// The config arg shape shared by every public mutation: the client always
-// sends the content hash, and additionally the full compiled config the first
-// time it uses a hash (which the component registers).
-const configHashArg = v.string();
-const graphConfigArg = v.optional(v.any());
+// The config arg shape shared by every public write: the content hash always,
+// the full compiled config on the client's first use of that hash.
+const configArgs = { configHash: v.string(), graphConfig: v.optional(v.any()) };
+
+const REBUILD: WorkItem = { kind: "rebuild", phase: "derive", after: null };
 
 // ---------------------------------------------------------------------------
-// Reverse-edge helpers (single source of truth — used by add/remove/delete).
+// Continuations.
 // ---------------------------------------------------------------------------
 
-function reverseEdgeName(
-  config: GraphConfig,
-  objectType: string,
-  relation: string,
-  subjectType: string,
-): string | undefined {
-  return config.reverseEdges?.[objectType]?.[relation]?.[subjectType];
-}
-
-async function findRelationship(
-  ctx: any,
-  subject: Entity,
-  relation: string,
-  object: Entity,
-) {
-  return ctx.db
-    .query("relationships")
-    .withIndex("by_subject_relation_object", (q: any) =>
-      q
-        .eq("subjectType", subject.type)
-        .eq("subjectId", subject.id)
-        .eq("relation", relation)
-        .eq("objectType", object.type)
-        .eq("objectId", object.id),
-    )
-    .unique();
+/** Enqueue `cursor` (nothing when it has no item); `mock` parks it instead (test-time driver). */
+async function enqueueCursor(
+  ctx: MutationCtx,
+  cursor: Cursor,
+  mock: boolean,
+): Promise<void> {
+  if (cursor.items.length === 0) return;
+  if (mock) {
+    // Test-time escape hatch: park the cursor; the test decides when it runs.
+    await (ctx.db as any).insert("mockWorkpool", {
+      mutationName: "continueExpansion",
+      args: cursor,
+    });
+    return;
+  }
+  await expansionPool.enqueueMutation(
+    ctx,
+    internal.mutations.continueExpansion,
+    cursor,
+    {
+      onComplete: internal.mutations.chunkCompleted,
+      context: cursor,
+    },
+  );
 }
 
 /**
- * If `(subject)-[relation]->(object)` declares a reverse, insert the mirrored
- * base edge (unless it already exists) and return its descriptor for queueing.
+ * The environment of a transaction. `config` null is config-free work: a
+ * removal started by maintenance (CONTRACT §5.5 reads no rule), on the real
+ * workpool, with the default budget.
  */
-async function insertReverseEdge(
-  ctx: any,
-  config: GraphConfig,
-  subject: Entity,
-  relation: string,
-  object: Entity,
-): Promise<{ revId: string; reverseRel: string } | null> {
-  const reverseRel = reverseEdgeName(config, object.type, relation, subject.type);
-  if (!reverseRel) return null;
-  const existing = await findRelationship(ctx, object, reverseRel, subject);
-  if (existing) return null;
-  const revId = await ctx.db.insert("relationships", {
-    subjectType: object.type,
-    subjectId: object.id,
-    relation: reverseRel,
-    objectType: subject.type,
-    objectId: subject.id,
-  });
-  return { revId, reverseRel };
+export function envFor(
+  config: GraphConfig | null,
+  configHash: string | null,
+  budget?: number,
+): Env {
+  return { config, configHash, budget: budget ?? limitsOf(config).writeBudget };
 }
 
-/** Mirror of `insertReverseEdge` for removal. */
-async function deleteReverseEdge(
-  ctx: any,
-  config: GraphConfig,
-  subject: Entity,
-  relation: string,
-  object: Entity,
-): Promise<{ revId: string; reverseRel: string } | null> {
-  const reverseRel = reverseEdgeName(config, object.type, relation, subject.type);
-  if (!reverseRel) return null;
-  const existing = await findRelationship(ctx, object, reverseRel, subject);
-  if (!existing) return null;
-  await ctx.db.delete(existing._id);
-  return { revId: existing._id, reverseRel };
+/**
+ * Run `items` in this transaction (`execute`), then enqueue what is left,
+ * followed by `owed` (work this transaction owes but does not start), as at
+ * most ONE continuation with a fresh budget (CONTRACT §5.3, I5).
+ */
+export async function executeAndContinue(
+  ctx: MutationCtx,
+  env: Env,
+  items: WorkItem[],
+  owed: WorkItem[] = [],
+): Promise<Stats> {
+  const { rest, stats } = await execute(ctx, env, items);
+  await enqueueCursor(
+    ctx,
+    {
+      items: [...rest, ...owed],
+      configHash: env.configHash,
+      budget: limitsOf(env.config).writeBudget,
+      attempts: 0,
+    },
+    env.config?.mockWorkpool === true,
+  );
+  return stats;
 }
+
+/**
+ * Load the caller's config, registering it on first use, and make it the
+ * active config (EXPANSION.md §2.9). When that changes the active hash (a
+ * deploy, or a rollback to an earlier config), a `rebuild` under it is owed,
+ * enqueued in the same transaction behind the write's own leftovers, so the
+ * table is repaired without an operator and cursors of the previous config
+ * become stale (Lemma Q).
+ */
+async function envOf(
+  ctx: MutationCtx,
+  args: { configHash: string; graphConfig?: unknown },
+) {
+  const supplied = args.graphConfig as GraphConfig | undefined;
+  if (supplied !== undefined)
+    await ensureConfig(ctx, args.configHash, supplied);
+  const config = supplied ?? (await loadConfig(ctx, args.configHash));
+  const env = envFor(config, args.configHash);
+  const owed: WorkItem[] = (await activateConfig(ctx, args.configHash))
+    ? [REBUILD]
+    : [];
+  return { env, owed };
+}
+
+/**
+ * The cursor `payload` names, as this transaction may run it (EXPANSION.md
+ * §2.9): read by `parseCursor` (an unrecognized item is dropped), then, when
+ * its `configHash` is not the active hash, its add and rebuild items are
+ * dropped as stale (Lemma Q: nothing is owed to them); its removal items read
+ * no rule and are never stale. Null: nothing to run.
+ */
+async function liveCursor(
+  ctx: MutationCtx,
+  payload: unknown,
+): Promise<Cursor | null> {
+  const cursor = parseCursor(payload);
+  if (cursor === null) {
+    console.warn(
+      "Zbar: dropped a continuation payload of an unrecognized shape; run rebuild.",
+    );
+    return null;
+  }
+  let { items } = cursor;
+  if (cursor.configHash !== null) {
+    const active = await activeConfigHash(ctx);
+    if (active !== null && active !== cursor.configHash) {
+      items = items.filter(
+        (i) => i.kind === "remove" || i.kind === "deleteEntity",
+      );
+      if (items.length < cursor.items.length) {
+        console.debug(
+          `Zbar: dropped ${cursor.items.length - items.length} item(s) of inactive config '${cursor.configHash}'.`,
+        );
+      }
+    }
+  }
+  return items.length === 0 ? null : { ...cursor, items };
+}
+
+/** One chunk: run the cursor's items under its budget (CONTRACT §5.3); enqueue at most one continuation. */
+export const continueExpansion = internalMutation({
+  // Validated inside (`liveCursor`): a payload of a previous engine version
+  // must not fail at the boundary, where nothing would record it.
+  args: v.any(),
+  returns: v.null(),
+  handler: async (ctx, payload) => {
+    const cursor = await liveCursor(ctx, payload);
+    if (!cursor) return null;
+    const config =
+      cursor.configHash === null
+        ? null
+        : await loadConfig(ctx, cursor.configHash);
+    await executeAndContinue(
+      ctx,
+      envFor(config, cursor.configHash, cursor.budget),
+      cursor.items,
+    );
+    return null;
+  },
+});
+
+/**
+ * Workpool `onComplete` of every chunk (P4). A failed or canceled chunk wrote
+ * nothing; re-enqueue the same cursor (the same list) with half the budget,
+ * and after `MAX_ATTEMPTS` record it. Stale items are dropped instead (Lemma
+ * Q). Reads its arguments, the active hash and the workpool's own state,
+ * never the data its chunk read, so it cannot fail for the reason its chunk
+ * did.
+ */
+export const chunkCompleted = internalMutation({
+  args: vOnCompleteArgs(v.any()),
+  returns: v.null(),
+  handler: async (ctx, { context, result }) => {
+    if (result.kind === "success") return null;
+    const cursor = await liveCursor(ctx, context);
+    if (!cursor) return null;
+    const attempts = cursor.attempts + 1;
+    const error = result.kind === "failed" ? result.error : "canceled";
+    if (attempts < MAX_ATTEMPTS) {
+      await enqueueCursor(
+        ctx,
+        {
+          ...cursor,
+          budget: Math.max(1, Math.floor(cursor.budget / 2)),
+          attempts,
+        },
+        false,
+      );
+      return null;
+    }
+    await ctx.db.insert("expansionFailures", {
+      cursor: { ...cursor, attempts },
+      reason: result.kind,
+      error,
+      attempts,
+      createdAt: Date.now(),
+    });
+    console.error(
+      `Zbar: expansion chunk ${result.kind} ${attempts} times (${error}); recorded in expansionFailures. ` +
+        `Resume it with resumeExpansion once the cause is fixed.`,
+    );
+    return null;
+  },
+});
+
+/**
+ * Delete the record and re-enqueue its cursor: the same items and hash, the
+ * budget reset to the config's `writeBudget` and `attempts` to 0. Stale items
+ * are not re-enqueued (Lemma Q: nothing is owed to them).
+ */
+export const resumeExpansion = mutation({
+  args: { failureId: v.id("expansionFailures") },
+  returns: v.null(),
+  handler: async (ctx, { failureId }) => {
+    const failure = await ctx.db.get(failureId);
+    if (!failure)
+      throw new Error(`Zbar: expansion failure '${failureId}' not found.`);
+    if (failure.reason === "depth" || failure.reason === "paths") {
+      throw new Error(
+        `Zbar: a '${failure.reason}' failure is not a continuation. ` +
+          (failure.reason === "depth"
+            ? "Raise maxDepth, then run rebuild."
+            : "Run rebuild."),
+      );
+    }
+    await ctx.db.delete(failureId);
+    const cursor = await liveCursor(ctx, failure.cursor);
+    if (!cursor) return null;
+    const config =
+      cursor.configHash === null
+        ? null
+        : await loadConfig(ctx, cursor.configHash);
+    await enqueueCursor(
+      ctx,
+      { ...cursor, budget: limitsOf(config).writeBudget, attempts: 0 },
+      config?.mockWorkpool === true,
+    );
+    return null;
+  },
+});
 
 // ---------------------------------------------------------------------------
-// addRelation
+// Writes.
 // ---------------------------------------------------------------------------
 
 export const addRelation = mutation({
@@ -104,399 +289,40 @@ export const addRelation = mutation({
     relation: v.string(),
     object: objectValidator,
     properties: propertiesValidator,
-    configHash: configHashArg,
-    graphConfig: graphConfigArg,
-    asyncWrites: v.optional(v.boolean()),
-    onComplete: v.optional(v.any()),
+    ...configArgs,
   },
-  handler: async (ctx: any, args: any) => {
-    const config = await loadConfig(ctx, args.configHash, args.graphConfig);
-    return addRelationInternal(ctx, { ...args, config });
-  },
-});
-
-async function addRelationInternal(ctx: any, args: any): Promise<string> {
-  const { subject, relation, object, properties, onComplete, configHash, asyncWrites } = args;
-  const config = args.config as GraphConfig;
-
-  const existingRel = await findRelationship(ctx, subject, relation, object);
-
-  if (existingRel) {
-    // Only `properties` can differ now (conditions are gone). Patch in place;
-    // properties live on the base edge and are not replicated through the BFS.
-    if (
-      properties !== undefined &&
-      JSON.stringify(existingRel.properties ?? null) !==
-        JSON.stringify(properties ?? null)
-    ) {
-      await ctx.db.patch(existingRel._id, { properties });
-    }
-    if (onComplete) await executeOnComplete(ctx, onComplete, config, configHash, asyncWrites);
-    return existingRel._id;
-  }
-
-  const relId = await ctx.db.insert("relationships", {
-    subjectType: subject.type,
-    subjectId: subject.id,
-    relation,
-    objectType: object.type,
-    objectId: object.id,
-    properties,
-  });
-
-  const queue: any[] = [
-    {
-      subject,
-      relation,
-      object,
-      path: { baseIds: [relId] },
-      depth: 1,
-      // The auto-inserted reverse below handles the base-reverse side for this
-      // explicit add; skip the BFS effective-reverse push here to avoid
-      // duplicate effective paths for the same underlying base pair.
-      skipReverse: true,
-    },
-  ];
-
-  const rev = await insertReverseEdge(ctx, config, subject, relation, object);
-  if (rev) {
-    queue.push({
-      subject: object,
-      relation: rev.reverseRel,
-      object: subject,
-      path: { baseIds: [rev.revId] },
-      depth: 1,
-      skipReverse: true,
-    });
-  }
-
-  await runOrEnqueue(ctx, {
-    asyncWrites,
-    mockWorkpool: config.mockWorkpool,
-    chunkRef: internal.mutations.processAddChunk,
-    payload: { baseRelId: relId, queue, configHash, onComplete, asyncWrites: asyncWrites ?? false },
-    inlineFn: (c, p) => processAddChunkInternal(c, { ...p, config }),
-  });
-
-  return relId;
-}
-
-export const processAddChunk = internalMutation({
-  args: {
-    baseRelId: v.id("relationships"),
-    queue: v.array(v.any()),
-    configHash: v.string(),
-    onComplete: v.optional(v.any()),
-    asyncWrites: v.optional(v.boolean()),
-  },
-  handler: async (ctx: any, args: any) => {
-    const config = await loadConfig(ctx, args.configHash);
-    await processAddChunkInternal(ctx, { ...args, config });
+  returns: v.id("relationships"),
+  handler: async (ctx, args) => {
+    const { env, owed } = await envOf(ctx, args);
+    const { id, items } = await insertFact(ctx, env, args);
+    await executeAndContinue(ctx, env, items, owed);
+    return id;
   },
 });
-
-async function processAddChunkInternal(ctx: any, args: any): Promise<void> {
-  const { baseRelId, queue, onComplete, asyncWrites, configHash } = args;
-  const config = args.config as GraphConfig;
-
-  // Abort if the base relationship was deleted by a rapid subsequent update,
-  // but still fire cleanups so nothing is orphaned.
-  const baseRel = await ctx.db.get(baseRelId);
-  if (!baseRel) {
-    if (onComplete) await executeOnComplete(ctx, onComplete, config, configHash, asyncWrites);
-    return;
-  }
-
-  const CHUNK_SIZE = config.maxChunkSize ?? 50;
-  let processed = 0;
-
-  while (queue.length > 0 && (!asyncWrites || processed < CHUNK_SIZE)) {
-    processed++;
-    const current = queue.shift()!;
-    const sKey = buildScopeKey(current.subject.type, current.subject.id);
-    const oKey = buildScopeKey(current.object.type, current.object.id);
-
-    let eff = await ctx.db
-      .query("effectiveRelationships")
-      .withIndex("by_subject_relation_object", (q: any) =>
-        q.eq("subjectKey", sKey).eq("relation", current.relation).eq("objectKey", oKey),
-      )
-      .unique();
-
-    let isNewOrUpdated = false;
-    const currentPathKey = pathKey(current.path);
-    const canonicalCurrentPath = canonicalizePath(current.path);
-
-    if (!eff) {
-      eff = {
-        _id: await ctx.db.insert("effectiveRelationships", {
-          subjectKey: sKey,
-          relation: current.relation,
-          objectKey: oKey,
-          paths: [canonicalCurrentPath],
-        }),
-      };
-      isNewOrUpdated = true;
-    } else if (!eff.paths.some((p: any) => pathKey(p) === currentPathKey)) {
-      await ctx.db.patch(eff._id, { paths: [...eff.paths, canonicalCurrentPath] });
-      isNewOrUpdated = true;
-    }
-
-    if (isNewOrUpdated) {
-      await applyTraversalRulesToItem(ctx, { current, queue, graphConfig: config });
-    }
-  }
-
-  if (queue.length > 0) {
-    if (asyncWrites) {
-      await runOrEnqueue(ctx, {
-        asyncWrites,
-        mockWorkpool: config.mockWorkpool,
-        chunkRef: internal.mutations.processAddChunk,
-        payload: { baseRelId, queue, configHash, onComplete, asyncWrites },
-      });
-    }
-  } else if (onComplete) {
-    await executeOnComplete(ctx, onComplete, config, configHash, asyncWrites);
-  }
-}
-
-// ---------------------------------------------------------------------------
-// onComplete (Add-Before-Remove chaining)
-// ---------------------------------------------------------------------------
-
-async function executeOnComplete(
-  ctx: any,
-  onComplete: any,
-  config: GraphConfig,
-  configHash: string,
-  asyncWrites?: boolean,
-): Promise<void> {
-  if (!onComplete) return;
-
-  const kind =
-    onComplete.action === "removeRelationBatch"
-      ? "removeRelation"
-      : onComplete.action === "enqueueRemoveChunkBatch"
-        ? "enqueueRemoveChunk"
-        : onComplete.action;
-  const isBatch =
-    onComplete.action === "removeRelationBatch" ||
-    onComplete.action === "enqueueRemoveChunkBatch";
-  const argsList: any[] = isBatch ? onComplete.args : [onComplete.args];
-
-  for (const a of argsList) {
-    if (kind === "removeRelation") {
-      await removeRelationInternal(ctx, { ...a, config, configHash, asyncWrites });
-    } else if (kind === "enqueueRemoveChunk") {
-      await runOrEnqueue(ctx, {
-        asyncWrites,
-        mockWorkpool: config.mockWorkpool,
-        chunkRef: internal.mutations.processRemoveChunk,
-        payload: { queue: a.queue, configHash, asyncWrites },
-        inlineFn: (c, p) => processRemoveChunkInternal(c, { ...p, config }),
-      });
-    }
-  }
-}
-
-// ---------------------------------------------------------------------------
-// removeRelation
-// ---------------------------------------------------------------------------
-
-/** Delete a base edge (+ its declared reverse) and return the cascade seed queue. */
-async function deleteBaseRelation(ctx: any, config: GraphConfig, existingRel: any) {
-  const subject = { type: existingRel.subjectType, id: existingRel.subjectId };
-  const object = { type: existingRel.objectType, id: existingRel.objectId };
-  await ctx.db.delete(existingRel._id);
-
-  const queue: any[] = [
-    { subject, relation: existingRel.relation, object, removedRelationId: existingRel._id },
-  ];
-  const rev = await deleteReverseEdge(ctx, config, subject, existingRel.relation, object);
-  if (rev) {
-    queue.push({ subject: object, relation: rev.reverseRel, object: subject, removedRelationId: rev.revId });
-  }
-  return { queue };
-}
-
-async function removeRelationInternal(
-  ctx: any,
-  args: any,
-): Promise<false | { removed: true; effectiveRelationshipsRemoved: number }> {
-  const { subject, relation, object, configHash, asyncWrites } = args;
-  const config = args.config as GraphConfig;
-
-  const existingRel = await findRelationship(ctx, subject, relation, object);
-  if (!existingRel) return false;
-
-  const { queue } = await deleteBaseRelation(ctx, config, existingRel);
-
-  const inlineRemoved = await runOrEnqueue<number>(ctx, {
-    asyncWrites,
-    mockWorkpool: config.mockWorkpool,
-    chunkRef: internal.mutations.processRemoveChunk,
-    payload: { queue, configHash, asyncWrites },
-    inlineFn: (c, p) => processRemoveChunkInternal(c, { ...p, config }),
-  });
-
-  return { removed: true, effectiveRelationshipsRemoved: inlineRemoved ?? 0 };
-}
-
-export const processRemoveChunk = internalMutation({
-  args: {
-    queue: v.array(v.any()),
-    configHash: v.string(),
-    asyncWrites: v.optional(v.boolean()),
-  },
-  handler: async (ctx: any, args: any) => {
-    const config = await loadConfig(ctx, args.configHash);
-    await processRemoveChunkInternal(ctx, { ...args, config });
-  },
-});
-
-async function processRemoveChunkInternal(ctx: any, args: any): Promise<number> {
-  const { queue, configHash, asyncWrites } = args;
-  const config = args.config as GraphConfig;
-  let removedCount = 0;
-  const CHUNK_SIZE = config.maxChunkSize ?? 50;
-  let processed = 0;
-  const seen = new Set<string>();
-
-  const queueKey = (s: Entity, rel: string, o: Entity, id: string) =>
-    `${buildScopeKey(s.type, s.id)}:${rel}:${buildScopeKey(o.type, o.id)}:${id}`;
-
-  for (const item of queue) {
-    seen.add(queueKey(item.subject, item.relation, item.object, item.removedRelationId));
-  }
-
-  while (queue.length > 0 && (!asyncWrites || processed < CHUNK_SIZE)) {
-    processed++;
-    const current = queue.shift()!;
-    const sKey = buildScopeKey(current.subject.type, current.subject.id);
-    const oKey = buildScopeKey(current.object.type, current.object.id);
-    const cascadeId = current.removedRelationId;
-
-    const eff = await ctx.db
-      .query("effectiveRelationships")
-      .withIndex("by_subject_relation_object", (q: any) =>
-        q.eq("subjectKey", sKey).eq("relation", current.relation).eq("objectKey", oKey),
-      )
-      .unique();
-    if (!eff) continue;
-
-    const remainingPaths = eff.paths.filter(
-      (p: any) => !p.baseIds || !p.baseIds.includes(cascadeId),
-    );
-
-    let shouldCascade = false;
-    if (remainingPaths.length === 0) {
-      await ctx.db.delete(eff._id);
-      removedCount++;
-      shouldCascade = true;
-    } else if (remainingPaths.length !== eff.paths.length) {
-      await ctx.db.patch(eff._id, { paths: remainingPaths });
-      shouldCascade = true;
-    }
-
-    if (!shouldCascade) continue;
-
-    // Propagate the token deletion downstream through the same rule matching
-    // the add-path BFS uses (shared via collectRuleDerivations).
-    const enqueue = (s: Entity, rel: string, o: Entity) => {
-      const k = queueKey(s, rel, o, cascadeId);
-      if (seen.has(k)) return;
-      seen.add(k);
-      queue.push({ subject: s, relation: rel, object: o, removedRelationId: cascadeId });
-    };
-
-    for (const { rule, derivedSubject, derivedObject } of await collectRuleDerivations(
-      ctx,
-      current,
-      config,
-    )) {
-      enqueue(derivedSubject, rule.derivedRelation, derivedObject);
-    }
-
-    // Effective reverse-edge cascade (mirror of the add path).
-    const reverseRel = reverseEdgeName(
-      config,
-      current.object.type,
-      current.relation,
-      current.subject.type,
-    );
-    if (reverseRel) {
-      enqueue(current.object, reverseRel, current.subject);
-    }
-  }
-
-  if (queue.length > 0 && asyncWrites) {
-    await runOrEnqueue(ctx, {
-      asyncWrites,
-      mockWorkpool: config.mockWorkpool,
-      chunkRef: internal.mutations.processRemoveChunk,
-      payload: { queue, configHash, asyncWrites },
-    });
-  }
-
-  return removedCount;
-}
 
 export const removeRelation = mutation({
   args: {
     subject: subjectValidator,
     relation: v.string(),
     object: objectValidator,
-    configHash: configHashArg,
-    graphConfig: graphConfigArg,
-    asyncWrites: v.optional(v.boolean()),
+    ...configArgs,
   },
-  handler: async (ctx: any, args: any) => {
-    const config = await loadConfig(ctx, args.configHash, args.graphConfig);
-    const res = await removeRelationInternal(ctx, { ...args, config });
-    return res ? res.removed : false;
-  },
-});
-
-// ---------------------------------------------------------------------------
-// updateRelation / setRelation (Add-Before-Remove)
-// ---------------------------------------------------------------------------
-
-export const updateRelation = mutation({
-  args: {
-    subject: subjectValidator,
-    oldRelation: v.string(),
-    newRelation: v.string(),
-    object: objectValidator,
-    properties: propertiesValidator,
-    configHash: configHashArg,
-    graphConfig: graphConfigArg,
-    asyncWrites: v.optional(v.boolean()),
-  },
-  handler: async (ctx: any, args: any) => {
-    const { subject, oldRelation, newRelation, object, properties, configHash, asyncWrites } = args;
-    const config = await loadConfig(ctx, configHash, args.graphConfig);
-
-    let onComplete: any = undefined;
-    const existingOldRel = await findRelationship(ctx, subject, oldRelation, object);
-    if (existingOldRel) {
-      const removedData = await deleteBaseRelation(ctx, config, existingOldRel);
-      onComplete = { action: "enqueueRemoveChunk", args: removedData };
-    }
-
-    return addRelationInternal(ctx, {
-      subject,
-      relation: newRelation,
-      object,
-      properties,
-      config,
-      configHash,
-      asyncWrites,
-      onComplete,
-    });
+  returns: v.boolean(),
+  handler: async (ctx, args) => {
+    const { env, owed } = await envOf(ctx, args);
+    const fact = await findFact(ctx, args.subject, args.relation, args.object);
+    const items = fact ? (await deleteFact(ctx, fact)).items : [];
+    await executeAndContinue(ctx, env, items, owed);
+    return fact !== null;
   },
 });
 
+/**
+ * Replace every other relation in `objectRelations` that the subject holds on
+ * the object with `relation`, in one transaction. The add items run before
+ * the removal items (EXPANSION.md §2.9: a row both facts derive gains its new
+ * path before it loses the old one, so it never disappears).
+ */
 export const setRelation = mutation({
   args: {
     subject: subjectValidator,
@@ -504,134 +330,80 @@ export const setRelation = mutation({
     object: objectValidator,
     objectRelations: v.array(v.string()),
     properties: propertiesValidator,
-    configHash: configHashArg,
-    graphConfig: graphConfigArg,
-    asyncWrites: v.optional(v.boolean()),
+    ...configArgs,
   },
-  handler: async (ctx: any, args: any) => {
-    const { subject, relation, object, objectRelations, properties, configHash, asyncWrites } = args;
-    const config = await loadConfig(ctx, configHash, args.graphConfig);
-
-    const queries = objectRelations
-      .filter((r: string) => r !== relation)
-      .map((candidateRel: string) => findRelationship(ctx, subject, candidateRel, object));
-    const results = await Promise.all(queries);
-    const relationsToDrop = results.filter((r: any) => r !== null);
-
-    const onCompleteArgs = [];
-    for (const r of relationsToDrop) {
-      onCompleteArgs.push(await deleteBaseRelation(ctx, config, r));
+  returns: v.id("relationships"),
+  handler: async (ctx, args) => {
+    const { env, owed } = await envOf(ctx, args);
+    const added = await insertFact(ctx, env, args);
+    const removals: WorkItem[] = [];
+    for (const other of new Set(args.objectRelations)) {
+      if (other === args.relation) continue;
+      const fact = await findFact(ctx, args.subject, other, args.object);
+      if (fact) removals.push(...(await deleteFact(ctx, fact)).items);
     }
-
-    const onComplete =
-      onCompleteArgs.length > 0
-        ? { action: "enqueueRemoveChunkBatch", args: onCompleteArgs }
-        : undefined;
-
-    return addRelationInternal(ctx, {
-      subject,
-      relation,
-      object,
-      properties,
-      config,
-      configHash,
-      asyncWrites,
-      onComplete,
-    });
+    await executeAndContinue(ctx, env, [...added.items, ...removals], owed);
+    return added.id;
   },
 });
 
-// ---------------------------------------------------------------------------
-// deleteEntity
-// ---------------------------------------------------------------------------
-
+/**
+ * Remove every fact that touches the entity, through the same removal path,
+ * by cursor. The counts cover what this transaction did.
+ */
 export const deleteEntity = mutation({
-  args: {
-    entity: subjectValidator,
-    configHash: configHashArg,
-    graphConfig: graphConfigArg,
-    asyncWrites: v.optional(v.boolean()),
-  },
-  handler: async (ctx: any, args: any) => {
-    const { entity, configHash, asyncWrites } = args;
-    const config = await loadConfig(ctx, configHash, args.graphConfig);
-
-    let relationshipsRemoved = 0;
-    let effectiveRelationshipsRemoved = 0;
-
-    const remove = async (subject: Entity, relation: string, object: Entity) => {
-      const res = await removeRelationInternal(ctx, {
-        subject,
-        relation,
-        object,
-        config,
-        configHash,
-        asyncWrites,
-      });
-      if (res) {
-        relationshipsRemoved++;
-        effectiveRelationshipsRemoved += res.effectiveRelationshipsRemoved;
-      }
+  args: { entity: subjectValidator, ...configArgs },
+  returns: v.object({
+    relationshipsRemoved: v.number(),
+    effectiveRelationshipsRemoved: v.number(),
+  }),
+  handler: async (ctx, args) => {
+    const { env, owed } = await envOf(ctx, args);
+    const stats = await executeAndContinue(
+      ctx,
+      env,
+      [{ kind: "deleteEntity", entity: args.entity }],
+      owed,
+    );
+    return {
+      relationshipsRemoved: stats.factsDeleted,
+      effectiveRelationshipsRemoved: stats.rowsDeleted,
     };
-
-    const subjectMatches = await ctx.db
-      .query("relationships")
-      .withIndex("by_subject_relation_object", (q: any) =>
-        q.eq("subjectType", entity.type).eq("subjectId", entity.id),
-      )
-      .collect();
-    for (const m of subjectMatches) {
-      await remove(
-        { type: m.subjectType, id: m.subjectId },
-        m.relation,
-        { type: m.objectType, id: m.objectId },
-      );
-    }
-
-    const objectMatches = await ctx.db
-      .query("relationships")
-      .withIndex("by_object", (q: any) =>
-        q.eq("objectType", entity.type).eq("objectId", entity.id),
-      )
-      .collect();
-    for (const m of objectMatches) {
-      await remove(
-        { type: m.subjectType, id: m.subjectId },
-        m.relation,
-        { type: m.objectType, id: m.objectId },
-      );
-    }
-
-    return { relationshipsRemoved, effectiveRelationshipsRemoved };
   },
 });
 
-// ---------------------------------------------------------------------------
-// Test-only mock workpool helpers.
-// ---------------------------------------------------------------------------
-
-export const popMockWorkpool = internalMutation({
-  args: {},
-  handler: async (ctx: any) => {
-    const task = await ctx.db.query("mockWorkpool").first();
-    if (task) {
-      await ctx.db.delete(task._id);
-      return task;
-    }
+/**
+ * CONTRACT §5.6: re-derive from every fact under this config (phase derive),
+ * then retire every path this config does not justify (phase retire).
+ * Continues itself in the workpool; idempotent and resumable. Also enqueued
+ * automatically by any write that changes the active config (`envOf`).
+ */
+export const rebuild = mutation({
+  args: configArgs,
+  returns: v.null(),
+  handler: async (ctx, args) => {
+    const { env } = await envOf(ctx, args); // a rebuild owed by activation is this one
+    await executeAndContinue(ctx, env, [REBUILD]);
     return null;
   },
 });
 
-export const getMockWorkpool = internalMutation({
+// ---------------------------------------------------------------------------
+// Test-only mock workpool helpers (the table exists only under NODE_ENV=test).
+// ---------------------------------------------------------------------------
+
+export const getMockWorkpool = internalQuery({
   args: {},
-  handler: async (ctx: any) => {
-    return await ctx.db.query("mockWorkpool").collect();
-  },
+  returns: v.array(v.any()),
+  handler: async (ctx) =>
+    await (ctx.db as any).query("mockWorkpool").take(10_000),
 });
 
 export const deleteMockWorkpoolTask = internalMutation({
-  args: { id: v.id("mockWorkpool") },
-  handler: async (ctx: any, args: any) => {
-    await ctx.db.delete(args.id);
+  args: { id: v.string() },
+  returns: v.null(),
+  handler: async (ctx, { id }) => {
+    await ctx.db.delete(id as any);
+    return null;
   },
 });

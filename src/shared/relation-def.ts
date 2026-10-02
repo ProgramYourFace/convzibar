@@ -1,161 +1,152 @@
 /**
- * Shared helpers for walking `SchemaRelation` definitions.
+ * Arm parsing for the compiler (`helpers.ts`).
  *
- * The schema stores relation targets as a heterogeneous union (bare strings,
- * typed objects, userset strings, dot-paths, or arrays of the above). Multiple
- * modules need to discriminate and walk those shapes — keeping the
- * string-parsing rules in one place makes sure they stay consistent.
+ * The schema stores arms verbatim (strings and `materialize()` wrappers).
+ * Classifying them in one place keeps the grammar of CONTRACT.md §2 in one
+ * place: syntax decides walks / expands / inverse; a bare name is resolved
+ * against the entity's sets first and the entity types second.
  */
 
-// ============================================================================
-// Tagged target shapes.
-// ============================================================================
+type RelationTargetShape =
+  /** A bare name that is a set (relation or permission) on the same entity. */
+  | { kind: "inherits"; set: string; raw: string; materialized: boolean }
+  /** A bare name that is an entity type. */
+  | { kind: "facts"; subjectType: string; raw: string; materialized: boolean }
+  /** `'type#set'`. */
+  | {
+      kind: "expands";
+      subjectType: string;
+      targetSet: string;
+      raw: string;
+      materialized: boolean;
+    }
+  /** `'via.set'`. */
+  | {
+      kind: "walks";
+      viaRelation: string;
+      targetSet: string;
+      raw: string;
+      materialized: boolean;
+    }
+  /** `'~type#relation'`. */
+  | {
+      kind: "inverse";
+      subjectType: string;
+      relation: string;
+      raw: string;
+      materialized: boolean;
+    }
+  /** A bare name that is neither a set here nor an entity type. */
+  | { kind: "unknown"; raw: string; materialized: boolean }
+  /** Not one of the five forms (two operators, empty segments, three segments...). */
+  | { kind: "invalid"; raw: string; materialized: boolean; reason: string };
 
-/**
- * A single classified target of a relation. Strings are parsed against the
- * caller-provided context (`localRelations`, `entities`) so the discriminant
- * captures the string's *meaning*, not just its syntax.
- */
-export type RelationTargetShape =
-  /** `{ type: X }` or `{ type: X, reverse: Y }` — a typed subject reference. */
-  | { kind: "typed"; entityType: string; reverse?: string }
-  /** `"source.target"` — a read-time dot-path. */
-  | { kind: "dotPath"; source: string; target: string }
-  /** `"type#relation"` — a userset rewrite. */
-  | { kind: "userset"; entityType: string; targetRelation: string }
-  /** A bare string that resolves to a local relation on the current entity. */
-  | { kind: "localRef"; relation: string }
-  /** A bare string that resolves to an entity type in the schema. */
-  | { kind: "entity"; entityType: string }
-  /** A bare string that matches neither a local relation nor a declared entity. */
-  | { kind: "unknown"; raw: string };
+interface ClassificationContext {
+  /** Every set (relation AND permission) declared on the entity that owns the arm, but the set itself. */
+  localSets: ReadonlySet<string>;
+  /** All declared entity types. */
+  entities: ReadonlySet<string>;
+}
 
-export interface ClassificationContext {
-  /** Relations declared on the entity that *owns* the def being classified. */
-  localRelations: Record<string, unknown> | undefined;
-  /** All declared entity types — passed so bare-string entity refs resolve. */
-  entities: Record<string, unknown>;
+/** Split `a<sep>b` into exactly two non-empty segments, or undefined. */
+function pair(raw: string, sep: string): [string, string] | undefined {
+  const parts = raw.split(sep);
+  return parts.length === 2 && parts[0] && parts[1]
+    ? [parts[0], parts[1]]
+    : undefined;
 }
 
 /**
- * Classify a string reference found inside a relation def. The kind is
- * determined by syntax (dot-path, userset) first, then by lookup
- * (`localRelations` then `entities`), falling back to `unknown`.
+ * Classify one arm. Syntax first (exactly one of `~…#`, `#`, `.`), then a
+ * bare name resolves to a local set before an entity type, so a schema can
+ * always say "inherit `admin`" even if an entity were also called `admin`.
  */
-export function classifyStringRef(
-  raw: string,
+function classifyStringRef(
+  arm: string | { materialize: string },
   ctx: ClassificationContext,
 ): RelationTargetShape {
-  if (raw.includes(".")) {
-    const [source, target] = raw.split(".");
-    return { kind: "dotPath", source, target };
+  const materialized = typeof arm === "object";
+  const raw = typeof arm === "object" ? arm.materialize : arm;
+  const invalid = (reason: string): RelationTargetShape => ({
+    kind: "invalid",
+    raw,
+    materialized,
+    reason,
+  });
+
+  const hasHash = raw.includes("#");
+  const hasDot = raw.includes(".");
+  const hasTilde = raw.includes("~");
+  if ((hasHash && hasDot) || (hasTilde && (!raw.startsWith("~") || !hasHash))) {
+    return invalid("an arm uses exactly one of '#', '.' or a leading '~#'");
   }
-  if (raw.includes("#")) {
-    const [entityType, targetRelation] = raw.split("#");
-    return { kind: "userset", entityType, targetRelation };
+  if (hasTilde) {
+    const p = pair(raw.slice(1), "#");
+    if (!p || raw.slice(1).includes("~"))
+      return invalid("an inverse is written '~type#relation'");
+    return {
+      kind: "inverse",
+      subjectType: p[0],
+      relation: p[1],
+      raw,
+      materialized,
+    };
   }
-  if (ctx.localRelations && raw in ctx.localRelations) {
-    return { kind: "localRef", relation: raw };
+  if (hasHash) {
+    const p = pair(raw, "#");
+    if (!p) return invalid("an expansion is written 'type#relation'");
+    return {
+      kind: "expands",
+      subjectType: p[0],
+      targetSet: p[1],
+      raw,
+      materialized,
+    };
   }
-  if (raw in ctx.entities) {
-    return { kind: "entity", entityType: raw };
+  if (hasDot) {
+    const p = pair(raw, ".");
+    if (!p)
+      return invalid("a walk must have exactly two segments ('relation.set')");
+    return {
+      kind: "walks",
+      viaRelation: p[0],
+      targetSet: p[1],
+      raw,
+      materialized,
+    };
   }
-  return { kind: "unknown", raw };
+  if (ctx.localSets.has(raw))
+    return { kind: "inherits", set: raw, raw, materialized };
+  if (ctx.entities.has(raw))
+    return { kind: "facts", subjectType: raw, raw, materialized };
+  return { kind: "unknown", raw, materialized };
 }
 
 /**
- * Iterate the targets of a relation def, yielding one tagged shape per
- * entry. Handles the array-or-single wrapping and the string / typed
- * dispatch — callers match on `kind` instead of re-parsing strings.
+ * Classify every arm of one set (`undefined`: a set with no arms). Anything
+ * that is neither a string nor `{ materialize: string }` is invalid.
  */
 export function* iterateRelationTargets(
-  relDef: unknown,
+  arms: unknown,
   ctx: ClassificationContext,
 ): Generator<RelationTargetShape> {
-  if (relDef === undefined || relDef === null) return;
-  const defs = Array.isArray(relDef) ? relDef : [relDef];
-  for (const d of defs) {
+  if (arms === undefined || arms === null) return;
+  for (const d of Array.isArray(arms) ? arms : [arms]) {
     if (typeof d === "string") {
       yield classifyStringRef(d, ctx);
-      continue;
-    }
-    if (typeof d !== "object" || d === null) continue;
-
-    if ("type" in d && typeof (d as { type: unknown }).type === "string") {
-      const reverse =
-        "reverse" in d && typeof (d as { reverse: unknown }).reverse === "string"
-          ? (d as { reverse: string }).reverse
-          : undefined;
+    } else if (
+      d &&
+      typeof d === "object" &&
+      typeof (d as any).materialize === "string"
+    ) {
+      yield classifyStringRef(d as { materialize: string }, ctx);
+    } else {
       yield {
-        kind: "typed",
-        entityType: (d as { type: string }).type,
-        reverse,
+        kind: "invalid",
+        raw: JSON.stringify(d),
+        materialized: false,
+        reason: "not an arm",
       };
     }
   }
-}
-
-// ============================================================================
-// Unified inheritance walker.
-//
-// Walks a relation's local userset rewrites to produce every relation name it
-// transitively contains, given a seed of bare relation names. Used by both the
-// client (relation/permission inheritance) and the schema compiler.
-// ============================================================================
-
-export interface ExpandOptions {
-  /**
-   * When true, the walker recurses ONLY into strings that resolve to a
-   * local relation on the object entity. When false (default), any string
-   * without a `.` is treated as a recurrable ref — matching the historical
-   * client behaviour where userset strings would be added to the result set
-   * (harmless but noisy; no effective rows match).
-   */
-  strictLocalRefs?: boolean;
-}
-
-/**
- * Expand a seed set of relation names into every relation name they
- * transitively contain via local userset rewrites on `objectType`.
- */
-export function expandRelationTargets(
-  schema: {
-    entities: Record<string, { relations?: Record<string, unknown> } | undefined>;
-  },
-  objectType: string,
-  seed: ReadonlyArray<string>,
-  options: ExpandOptions = {},
-): string[] {
-  const strict = options.strictLocalRefs ?? false;
-  const localRelations =
-    (schema.entities[objectType]?.relations as Record<string, unknown>) ?? {};
-  const results: string[] = [];
-  const seen = new Set<string>();
-
-  const recurseString = (ref: string) => {
-    if (ref.includes(".")) return;
-    if (strict) {
-      if (ref.includes("#")) return;
-      if (localRelations[ref] === undefined) return;
-    }
-    expand(ref);
-  };
-
-  const expand = (rel: string) => {
-    if (seen.has(rel)) return;
-    seen.add(rel);
-    results.push(rel);
-
-    const relDef = localRelations[rel];
-    if (!relDef) return;
-    const defs = Array.isArray(relDef) ? relDef : [relDef];
-
-    for (const d of defs) {
-      if (typeof d === "string") recurseString(d);
-    }
-  };
-
-  for (const s of seed) expand(s);
-
-  return results;
 }

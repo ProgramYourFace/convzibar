@@ -1,58 +1,26 @@
-import { iterateRelationTargets } from "../../shared/relation-def";
+import { writableSubjectTypes } from "../../component/helpers";
 /**
- * Verify that the (subject.type, relation, object.type) triple is consistent
- * with what the schema declares. Throws a descriptive error otherwise.
- *
- * "Valid subject types" are collected from every declaration on the relation:
- * bare entity-type strings, typed-target objects, userset references, and
- * local-relation references (recursively expanded). Dot-path declarations
- * contribute no direct subject types — a relation with only dot-paths is
- * derived and cannot be written directly.
+ * Verify that a fact `(subject, relation, object)` may be written: the
+ * relation exists and is writable (not a permission), and the subject's type
+ * is a facts arm of the relation or of a relation it inherits (expansions
+ * imply their type). Throws a descriptive error otherwise.
  */
 export function validateRelationParameter(z, subject, relation, object) {
-    const objectEntity = z.schema.entities[object.type];
-    if (!objectEntity?.relations || !(relation in objectEntity.relations)) {
+    const set = z.graphConfig.sets[object.type]?.[relation];
+    if (!set) {
         throw new Error(`Zbar Schema Error: Relation '${relation}' is not defined for object type '${object.type}'.`);
     }
-    const validSubjectTypes = collectDirectSubjectTypes(z, object.type, relation, new Set());
-    if (validSubjectTypes.size === 0) {
+    if (!set.writable) {
+        throw new Error(`Zbar Schema Error: '${relation}' on '${object.type}' is a permission; facts are written to relations only.`);
+    }
+    const validSubjectTypes = writableSubjectTypes(z.graphConfig, object.type, relation);
+    if (validSubjectTypes.length === 0) {
         throw new Error(`Zbar Schema Error: Relation '${relation}' on '${object.type}' declares no direct typed subjects ` +
-            `(it is derived via dot-path or read-time declarations). Write the underlying base edge instead.`);
+            `(it is derived through walks or inverses). Write the underlying fact instead.`);
     }
-    if (!validSubjectTypes.has(subject.type)) {
-        throw new Error(`Zbar Schema Error: Subject type '${subject.type}' is not a valid subject for relation '${relation}' on object type '${object.type}'. Valid subject types: ${[...validSubjectTypes].join(", ")}.`);
+    if (!validSubjectTypes.includes(subject.type)) {
+        throw new Error(`Zbar Schema Error: Subject type '${subject.type}' is not a valid subject for relation '${relation}' on object type '${object.type}'. Valid subject types: ${validSubjectTypes.join(", ")}.`);
     }
-}
-function collectDirectSubjectTypes(z, objectType, relation, visited) {
-    if (visited.has(relation))
-        return new Set();
-    visited.add(relation);
-    const entity = z.schema.entities[objectType];
-    const localRelations = entity?.relations ?? {};
-    const relDef = localRelations[relation];
-    if (relDef === undefined)
-        return new Set();
-    const classifyCtx = {
-        localRelations: localRelations,
-        entities: z.schema.entities,
-    };
-    const types = new Set();
-    for (const target of iterateRelationTargets(relDef, classifyCtx)) {
-        switch (target.kind) {
-            case "typed":
-            case "userset":
-            case "entity":
-                types.add(target.entityType);
-                break;
-            case "localRef":
-                for (const t of collectDirectSubjectTypes(z, objectType, target.relation, visited)) {
-                    types.add(t);
-                }
-                break;
-            // dotPath / unknown → no direct subject contribution
-        }
-    }
-    return types;
 }
 /**
  * Validate edge properties against the schema-defined validators.

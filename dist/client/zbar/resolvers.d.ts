@@ -1,12 +1,13 @@
 import type { ZbarInternal } from "../internal";
 /**
- * Expand a permission name into the full set of relations that satisfy it on a
- * given object type, walking userset rewrites recursively. Memoised.
+ * `set` plus every set it transitively inherits (CONTRACT §2.4), e.g. `owner`
+ * → `[owner, admin, viewer]` when `owner` inherits `admin` inherits `viewer`.
+ * Relations and permissions are both sets. Empty for an unknown name.
  */
-export declare function resolvePermissionRelations(z: ZbarInternal, objectType: string, permission: string): string[];
+export declare function resolveRelationInheritance(z: ZbarInternal, objectType: string, set: string): string[];
 /**
- * Expand a relation into itself plus all relations it transitively contains via
- * local userset rewrites (e.g. `owner` → `[owner, admin, viewer]`). Memoised.
+ * The writable relations in `set`'s closure: what a first hop through `set`
+ * reads facts of (CONTRACT §2.1).
  */
-export declare function resolveRelationInheritance(z: ZbarInternal, objectType: string, relation: string): string[];
+export declare function resolveFactRelations(z: ZbarInternal, objectType: string, set: string): string[];
 //# sourceMappingURL=resolvers.d.ts.map

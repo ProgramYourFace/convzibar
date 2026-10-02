@@ -1,41 +1,30 @@
-import { expandRelationTargets } from "../../shared/relation-def";
 import type { ZbarInternal } from "../internal";
 
-/**
- * Expand a permission name into the full set of relations that satisfy it on a
- * given object type, walking userset rewrites recursively. Memoised.
- */
-export function resolvePermissionRelations(
-  z: ZbarInternal,
-  objectType: string,
-  permission: string,
-): string[] {
-  const cacheKey = `${objectType}:${permission}`;
-  const cached = z.permissionRelationsCache.get(cacheKey);
-  if (cached) return cached;
-
-  const perms = z.schema.entities[objectType]?.permissions?.[permission] || [];
-  const results = expandRelationTargets(z.schema, objectType, perms);
-
-  z.permissionRelationsCache.set(cacheKey, results);
-  return results;
-}
+// Reads of the closures the compiler precomputed (`GraphConfig.inherits`,
+// `GraphConfig.factRelations`), so local inheritance can never be derived two
+// different ways.
 
 /**
- * Expand a relation into itself plus all relations it transitively contains via
- * local userset rewrites (e.g. `owner` → `[owner, admin, viewer]`). Memoised.
+ * `set` plus every set it transitively inherits (CONTRACT §2.4), e.g. `owner`
+ * → `[owner, admin, viewer]` when `owner` inherits `admin` inherits `viewer`.
+ * Relations and permissions are both sets. Empty for an unknown name.
  */
 export function resolveRelationInheritance(
   z: ZbarInternal,
   objectType: string,
-  relation: string,
+  set: string,
 ): string[] {
-  const cacheKey = `rel_inh:${objectType}:${relation}`;
-  const cached = z.permissionRelationsCache.get(cacheKey);
-  if (cached) return cached;
+  return z.graphConfig.inherits[objectType]?.[set] ?? [];
+}
 
-  const results = expandRelationTargets(z.schema, objectType, [relation]);
-
-  z.permissionRelationsCache.set(cacheKey, results);
-  return results;
+/**
+ * The writable relations in `set`'s closure: what a first hop through `set`
+ * reads facts of (CONTRACT §2.1).
+ */
+export function resolveFactRelations(
+  z: ZbarInternal,
+  objectType: string,
+  set: string,
+): string[] {
+  return z.graphConfig.factRelations[objectType]?.[set] ?? [];
 }

@@ -1,9 +1,10 @@
 // Public API surface for the convzibar client.
 // Implementation lives in topical sub-modules — this file re-exports only.
 
-// Core types & errors
+// Core types
 export type {
-  SchemaRelation,
+  SchemaArm,
+  MaterializedArm,
   EntityDefinition,
   ZbarSchema,
   BuiltZbarSchema,
@@ -11,11 +12,16 @@ export type {
   EntityPermissions,
   EntityRelations,
   EntityRelationProperties,
+  ResolvedProperties,
 } from "./types";
-export { PermissionError } from "./types";
 
 // Schema builder
-export { EntityBuilder, SchemaBuilder, createZbarSchema } from "./schema/builder";
+export {
+  EntityBuilder,
+  SchemaBuilder,
+  createZbarSchema,
+  materialize,
+} from "./schema/builder";
 
 // list() fluent interfaces
 export type {

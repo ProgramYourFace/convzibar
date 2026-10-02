@@ -1,180 +1,89 @@
-import { expect, test, describe } from "vitest";
-import { Zbar, createZbarSchema } from "../index.js";
-import { convexTest } from "convex-test";
-import schema from "../../component/schema.js";
-import { api } from "../../component/_generated/api.js";
-import { register as registerWorkpool } from "@convex-dev/workpool/test";
+/**
+ * EXPANSION.md P4 (liveness) under the REAL workpool: a chunk that keeps
+ * failing is retried with half its budget, recorded in `expansionFailures`
+ * with its exact cursor after 5 attempts, and `resumeExpansion` completes it.
+ */
+import { zbarEngineTest } from "../../test";
+import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
+import { api } from "../../component/_generated/api";
+import {
+  TEAM,
+  engine,
+  expectExact,
+  graphConfig,
+  snapshot,
+} from "./expansion-harness";
 
-const setup = () => {
-  const t = convexTest(schema, import.meta.glob("../../component/**/*.ts"));
-  registerWorkpool(t, "workpool");
-  return t;
-};
+beforeEach(() => {
+  vi.useFakeTimers();
+});
+afterEach(() => {
+  vi.useRealTimers();
+});
 
-// Inspect effective rows for (subject, relations, object) via the collapsed
-// forward query.
-const checkFast = (
-  runner: any,
-  a: { subject: any; relations: string[]; object: any },
-) =>
-  runner.query(api.queries.effectiveForward, {
-    subjects: [a.subject],
-    relations: a.relations,
-    objectPoints: [`${a.object.type}:${a.object.id}`],
-  });
+const settle = (t: any) => t.finishAllScheduledFunctions(vi.runAllTimers, 1000);
 
-async function assertDbState(
-  t: any,
-  expectedRelationships: number,
-  expectedEffectiveRelationships: number,
-) {
-  const relationships = await t.run(
-    async (innerCtx: any) => await innerCtx.db.query("relationships").collect(),
-  );
-  const effectiveRelationships = await t.run(
-    async (innerCtx: any) =>
-      await innerCtx.db.query("effectiveRelationships").collect(),
-  );
+describe("P4 liveness: every expansion drains or is recorded", () => {
+  test("a chunk failing 5 times lands in expansionFailures with its cursor; resumeExpansion completes it", async () => {
+    const t = zbarEngineTest();
+    const config = graphConfig([TEAM], { writeBudget: 1, mock: false });
+    const z = engine(t, config, "p4");
+    for (const u of ["u1", "u2", "u3"])
+      await z.add(`user:${u}`, "member", "squad:s");
+    await z.add("squad:s", "member", "team:t"); // one row inline, the rest continues by cursor
 
-  expect(relationships.length).toBe(expectedRelationships);
-  expect(effectiveRelationships.length).toBe(expectedEffectiveRelationships);
-}
-
-const zbarSchema = createZbarSchema()
-  .entity("user")
-  .entity("org", (e) =>
-    e
-      .relation("owner", "user")
-      .relation("admin", "user", "owner")
-      .relation("viewer", "user", "admin")
-      .permission("edit_settings", "admin")
-      .permission("view_dashboard", "viewer"),
-  )
-  .entity("project", (e) =>
-    e
-      .relation("parent_org", "org")
-      .relation("editor", "user", "parent_org.admin")
-      .permission("edit", "editor"),
-  )
-  .build();
-
-const mkCtx = (t: any) =>
-  ({
-    runQuery: t.query.bind(t),
-    runMutation: t.mutation.bind(t),
-  }) as any;
-
-const mkZbar = () =>
-  new Zbar(api, {
-    schema: zbarSchema,
-    asyncWrites: false,
-  });
-
-describe("Mutation Operations", () => {
-  test("deleteEntity removes all associated relationships", async () => {
-    const t = setup();
-    const ctx = mkCtx(t);
-    const zbar = mkZbar();
-
-    const user = { type: "user", id: "u_delete" } as const;
-    const org = { type: "org", id: "org1" } as const;
-    const project = { type: "project", id: "proj1" } as const;
-
-    await zbar.addRelation(ctx, user, "owner", org);
-    await zbar.addRelation(ctx, org, "parent_org", project);
-
-    const relsBefore = await checkFast(t, {
-      subject: user,
-      relations: ["owner"],
-      object: org,
+    // Make every continuation fail: its config hash is no longer registered.
+    await t.run(async (ctx: any) => {
+      for (const c of await ctx.db.query("configs").collect())
+        await ctx.db.delete(c._id);
     });
-    expect(relsBefore.length).toBe(1);
+    await settle(t);
 
-    const res = await zbar.deleteEntity(ctx, user);
-
-    expect(res.relationshipsRemoved).toBe(1);
-    expect(res.effectiveRelationshipsRemoved).toBeGreaterThan(0);
-
-    const relsAfter = await checkFast(t, {
-      subject: user,
-      relations: ["owner"],
-      object: org,
+    // One chunk was in flight (a first registration enqueues no rebuild):
+    // the add continuation. It failed 5 times and is recorded.
+    const failures = await t.query(api.queries.listExpansionFailures, {});
+    expect(
+      failures.map((f: any) => f.cursor.items.map((i: any) => i.kind)),
+    ).toEqual([["add"]]);
+    const failure = failures[0];
+    expect(failure.reason).toBe("failed");
+    expect(failure.attempts).toBe(5);
+    expect(failure.error).toContain("not registered");
+    expect(failure.cursor.items[0]).toMatchObject({
+      kind: "add",
+      trigger: "first",
+      rule: TEAM.key,
     });
-    expect(relsAfter.length).toBe(0);
-
-    const relationships = await t.run(
-      async (innerCtx) => await innerCtx.db.query("relationships").collect(),
+    expect(failure.cursor.budget).toBe(1); // halved down to the floor
+    const derived = (await snapshot(t)).rows.filter(
+      (r: any) => r.objectKey === "team:t" && r.subjectKey.startsWith("user:"),
     );
-    const effectiveRelationships = await t.run(
-      async (innerCtx) =>
-        await innerCtx.db.query("effectiveRelationships").collect(),
-    );
+    expect(derived).toHaveLength(1); // nothing was silently written or dropped
 
-    expect(relationships.length).toBe(1);
-    expect(relationships[0].relation).toBe("parent_org");
-    expect(effectiveRelationships.length).toBe(1);
-    expect(effectiveRelationships[0].relation).toBe("parent_org");
+    // Fix the cause, resume both: the expansion completes and the records are gone.
+    await t.run(async (ctx: any) =>
+      ctx.db.insert("configs", { hash: "p4", config }),
+    );
+    for (const f of failures)
+      await t.mutation(api.mutations.resumeExpansion, { failureId: f._id });
+    await settle(t);
+    expect(await t.query(api.queries.listExpansionFailures, {})).toEqual([]);
+    await expectExact(t, [TEAM], 16);
   });
 
-  test("updateRelation swaps relationships via Add-before-Remove", async () => {
-    const t = setup();
-    const ctx = mkCtx(t);
-    const zbar = mkZbar();
-
-    const user = { type: "user", id: "u_update" } as const;
-    const org = { type: "org", id: "org1" } as const;
-
-    await zbar.addRelation(ctx, user, "viewer", org);
-
-    expect(await zbar.hasRelationship(ctx, user, "viewer", org)).toBe(true);
-    expect(await zbar.hasRelationship(ctx, user, "admin", org)).toBe(false);
-
-    await zbar.updateRelation(ctx, user, "viewer", "admin", org);
-
-    expect(await zbar.hasRelationship(ctx, user, "admin", org)).toBe(true);
-    expect(await zbar.hasRelationship(ctx, user, "viewer", org)).toBe(true);
-
-    const explicit = await zbar.listDirect()
-      .object(org)
-      .subject(user)
-      .collect(ctx);
-    expect(explicit.map((r) => r.relation)).toEqual(["admin"]);
-
-    await assertDbState(t, 1, 1);
-  });
-
-  test("setRelation replaces all existing relationships with a single new one", async () => {
-    const t = setup();
-    const ctx = mkCtx(t);
-    const zbar = mkZbar();
-
-    const user = { type: "user", id: "u_set" } as const;
-    const org = { type: "org", id: "org1" } as const;
-
-    await zbar.addRelation(ctx, user, "viewer", org);
-    await zbar.addRelation(ctx, user, "admin", org);
-
-    let explicit = await zbar.listDirect()
-      .object(org)
-      .subject(user)
-      .collect(ctx);
-    expect(explicit.map((r) => r.relation).sort()).toEqual(["admin", "viewer"]);
-
-    await zbar.setRelation(ctx, user, "owner", org);
-
-    explicit = await zbar.listDirect()
-      .object(org)
-      .subject(user)
-      .collect(ctx);
-    expect(explicit.map((r) => r.relation)).toEqual(["owner"]);
-
-    const all = await zbar.listDirect()
-      .object(org)
-      .subject(user)
-      .relation("viewer")
-      .collect(ctx);
-    expect(all.map((r) => r.relation)).toEqual(["owner"]);
-
-    await assertDbState(t, 1, 1);
+  test("a depth failure is recorded, not resumable", async () => {
+    const t = zbarEngineTest();
+    const z = engine(
+      t,
+      graphConfig([TEAM], { maxDepth: 1, mock: false }),
+      "depth",
+    );
+    await z.add("user:u", "member", "squad:s");
+    await z.add("squad:s", "member", "team:t");
+    const [failure] = await t.query(api.queries.listExpansionFailures, {});
+    expect(failure.reason).toBe("depth");
+    await expect(
+      t.mutation(api.mutations.resumeExpansion, { failureId: failure._id }),
+    ).rejects.toThrow(/not a continuation/);
   });
 });

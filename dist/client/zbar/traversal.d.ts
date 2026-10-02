@@ -3,203 +3,73 @@ export interface Entity {
     type: string;
     id: string;
 }
+type Ctx = QueryCtx | ActionCtx;
+/** Each id with the fewest facts of the derivations found for it (CONTRACT §4.7). */
+type Levels = Map<string, number>;
 export interface Traversal {
     /**
-     * Minimum number of `effectiveRelationships` queries on the *cheapest*
-     * path that can satisfy this traversal. A leaf is 1; a `Compose` is the
-     * sum of its hops (both must run); a `Union` is the min of its children
-     * (the cheapest branch can answer it). Used by `Union.of` to order
-     * children ascending so narrowing / short-circuit probes the cheapest
-     * branch first. (Consistently "cheapest path", not worst case — that's
-     * why `Union` takes the min and `Compose` the sum.)
+     * Index reads on the cheapest path that can answer a check: a leaf is 1, a
+     * `Compose` the sum of its hops, a `Union` the min of its children. `Union.of`
+     * sorts children by it so narrowing probes the cheap branches first.
      */
     readonly cost: number;
-    check(ctx: QueryCtx | ActionCtx, subject: Entity, object: Entity): Promise<boolean>;
-    /** Of the given candidate object IDs, which does `subject` reach? */
-    checkBatch(ctx: QueryCtx | ActionCtx, subject: Entity, objectType: string, candidateIds: readonly string[]): Promise<Set<string>>;
-    /** Reverse direction: of the candidate subject IDs, which reach `object`? */
-    checkBatchSubjects(ctx: QueryCtx | ActionCtx, object: Entity, subjectType: string, candidateIds: readonly string[]): Promise<Set<string>>;
-    /** All `objectType` IDs reachable from `subject`. */
-    expandObjects(ctx: QueryCtx | ActionCtx, subject: Entity, objectType: string): Promise<Set<string>>;
-    /** All `subjectType` IDs reaching `object`. */
-    expandSubjects(ctx: QueryCtx | ActionCtx, object: Entity, subjectType: string): Promise<Set<string>>;
-    /**
-     * Batched forward expansion: union of `objectType` IDs reachable from any
-     * of `subjects`. Lets chained `Compose` operators collapse the forward
-     * fan-out to O(depth) queries instead of O(branching ^ depth).
-     */
-    expandObjectsFromMany(ctx: QueryCtx | ActionCtx, subjects: readonly Entity[], objectType: string): Promise<Set<string>>;
-    /**
-     * Batched reverse expansion: union of `subjectType` IDs reaching any of
-     * `objects`. The mirror of `expandObjectsFromMany`; lets chained `Compose`
-     * reverse walks stay linear in depth.
-     */
-    expandSubjectsFromMany(ctx: QueryCtx | ActionCtx, objects: readonly Entity[], subjectType: string): Promise<Set<string>>;
+    check(ctx: Ctx, subject: Entity, object: Entity): Promise<boolean>;
+    /** Of the candidate object ids, which does `subject` reach? */
+    checkBatch(ctx: Ctx, subject: Entity, objectType: string, candidateIds: readonly string[]): Promise<Set<string>>;
+    /** Of the candidate subject ids, which reach `object`? */
+    checkBatchSubjects(ctx: Ctx, object: Entity, subjectType: string, candidateIds: readonly string[]): Promise<Set<string>>;
+    /** Every `objectType` id `subject` reaches. */
+    expandObjects(ctx: Ctx, subject: Entity, objectType: string): Promise<Set<string>>;
+    /** Every `subjectType` id reaching `object`. */
+    expandSubjects(ctx: Ctx, object: Entity, subjectType: string): Promise<Set<string>>;
+    /** Union of `expandObjects` over many subjects, batched so chained hops stay O(depth) reads. */
+    expandObjectsFromMany(ctx: Ctx, subjects: readonly Entity[], objectType: string): Promise<Set<string>>;
+    /** Union of `expandSubjects` over many objects. */
+    expandSubjectsFromMany(ctx: Ctx, objects: readonly Entity[], subjectType: string): Promise<Set<string>>;
+    checkLevels(ctx: Ctx, subject: Entity, objectType: string, ids: readonly string[]): Promise<Levels>;
+    objectLevels(ctx: Ctx, subjects: readonly Entity[], objectType: string): Promise<Levels>;
+    subjectLevels(ctx: Ctx, objects: readonly Entity[], subjectType: string): Promise<Levels>;
 }
+type Far = {
+    type: string;
+    ids?: readonly string[];
+};
+/** One fact or row, normalised; `facts` is its lineage length (1 for a fact, a row's shortest path). */
+type Edge = {
+    subjectId: string;
+    objectId: string;
+    facts: number;
+    properties?: unknown;
+};
+/** Facts read from either end; exported for `listDirect`. */
+export declare const readFactsForward: (z: ZbarInternal, ctx: Ctx, subjects: readonly Entity[], relations: readonly string[], far: Far) => Promise<Edge[]>;
+export declare const readFactsReverse: (z: ZbarInternal, ctx: Ctx, objects: readonly Entity[], relations: readonly string[], far: Far) => Promise<Edge[]>;
 /**
- * Existence and enumeration against the materialised graph. `relations` is
- * a union — operations succeed if any of them apply.
+ * Compile `(objectType, set)` — a relation or a permission — into a plan
+ * (CONTRACT §3). Memoised per compiled config. An unknown set is `EMPTY`.
+ *
+ *   Union( Materialised(writable members ∪ members with materialized arms),
+ *          Inverse per inverse arm,
+ *          Compose(first hop = facts, planSet(T, target)) per computed walks/expands arm )
+ *
+ * A set in a recursive component is a `Closure` over the component instead;
+ * any other set that reaches a cycle (`maxLineage` null) is that union
+ * wrapped in `Counted`, so its answers are settled by fact count (CONTRACT
+ * §4.7). The far-set graph outside cycles is a DAG, so the recursion through
+ * `planSet` terminates.
  */
-export declare class Materialised implements Traversal {
-    private readonly z;
-    readonly relations: readonly string[];
-    readonly cost = 1;
-    constructor(z: ZbarInternal, relations: readonly string[]);
-    check(ctx: QueryCtx | ActionCtx, subject: Entity, object: Entity): Promise<boolean>;
-    checkBatch(ctx: QueryCtx | ActionCtx, subject: Entity, objectType: string, candidateIds: readonly string[]): Promise<Set<string>>;
-    checkBatchSubjects(ctx: QueryCtx | ActionCtx, object: Entity, subjectType: string, candidateIds: readonly string[]): Promise<Set<string>>;
-    expandObjects(ctx: QueryCtx | ActionCtx, subject: Entity, objectType: string): Promise<Set<string>>;
-    expandSubjects(ctx: QueryCtx | ActionCtx, object: Entity, subjectType: string): Promise<Set<string>>;
-    /**
-     * Batched forward expansion: union of objects of `objectType` reachable
-     * from any of `subjects`. One round-trip instead of N; falls through to the
-     * cheaper singleton query when only one subject is supplied.
-     */
-    expandObjectsFromMany(ctx: QueryCtx | ActionCtx, subjects: readonly Entity[], objectType: string): Promise<Set<string>>;
-    /**
-     * Batched reverse expansion: union of subjects of `subjectType` reaching any
-     * of `objects`. One round-trip instead of N; falls through to the cheaper
-     * singleton query when only one object is supplied.
-     */
-    expandSubjectsFromMany(ctx: QueryCtx | ActionCtx, objects: readonly Entity[], subjectType: string): Promise<Set<string>>;
-}
+export declare function planSet(z: ZbarInternal, objectType: string, set: string): Traversal;
 /**
- * Source-side primitive for Compose. Wraps a typed relation lookup and
- * exposes three directions — per-object, per-subject (forward, for
- * expandObjects fan-out), and batched forward (for Compose.expandObjects).
+ * Granted permissions, in input order. One batched `Materialised` read covers
+ * every permission's materialised members (a hit there is a grant: those rows
+ * are a subset of the set); the remaining permissions run their other
+ * branches, each distinct branch at most once (plans are memoised by
+ * structure, so permissions sharing an arm share the branch object).
  */
-export declare class EdgeExpand {
-    private readonly z;
-    readonly subjectType: string;
-    readonly relations: readonly string[];
-    /** Underlying Materialised — shared backend for all four access methods. */
-    private readonly mat;
-    constructor(z: ZbarInternal, subjectType: string, relations: readonly string[]);
-    list(ctx: QueryCtx | ActionCtx, object: Entity): Promise<Entity[]>;
-    /**
-     * Gather all intermediates reaching any of `objects`. One batched query
-     * instead of one per object — keeps reverse fan-in collapsed when a
-     * chained `Compose` walks the subject side backward. The singleton case
-     * still uses the non-batch query so it reads the cheaper index path.
-     */
-    listMany(ctx: QueryCtx | ActionCtx, objects: readonly Entity[]): Promise<Entity[]>;
-    /** Forward fan-out across many intermediates. */
-    listObjectsBatch(ctx: QueryCtx | ActionCtx, subjects: readonly Entity[], objectType: string): Promise<Set<string>>;
-}
-/**
- * Join at an intermediate of type `sourceSide.subjectType`.
- *
- *   subject --subjectSide--> M --sourceSide--> object
- *
- * `check`: enumerate M candidates via sourceSide, batch-check from subject
- * via subjectSide.
- *
- * `checkBatch` (and `checkBatchSubjects`): compute the full reachable set
- * once via `expand*`, then intersect with candidates — a single global
- * enumeration instead of per-candidate RT probes.
- *
- * `expandObjects`: fan out from subject to M via subjectSide, then use
- * `sourceSide.listObjectsBatch` (one Convex query) to collapse the forward
- * scan across all M at once.
- *
- * `expandSubjects`: fan out from object to M via sourceSide, then fan-in
- * via `subjectSide.expandSubjects` per M. The inner fan-in is parallel
- * (Promise.all). A deeper operator batching pass would squash this too;
- * step 2 takes the cheaper fixes.
- */
-export declare class Compose implements Traversal {
-    readonly sourceSide: EdgeExpand;
-    readonly subjectSide: Traversal;
-    readonly cost: number;
-    constructor(sourceSide: EdgeExpand, subjectSide: Traversal);
-    check(ctx: QueryCtx | ActionCtx, subject: Entity, object: Entity): Promise<boolean>;
-    checkBatch(ctx: QueryCtx | ActionCtx, subject: Entity, objectType: string, candidateIds: readonly string[]): Promise<Set<string>>;
-    checkBatchSubjects(ctx: QueryCtx | ActionCtx, object: Entity, subjectType: string, candidateIds: readonly string[]): Promise<Set<string>>;
-    expandObjects(ctx: QueryCtx | ActionCtx, subject: Entity, objectType: string): Promise<Set<string>>;
-    expandSubjects(ctx: QueryCtx | ActionCtx, object: Entity, subjectType: string): Promise<Set<string>>;
-    expandObjectsFromMany(ctx: QueryCtx | ActionCtx, subjects: readonly Entity[], objectType: string): Promise<Set<string>>;
-    expandSubjectsFromMany(ctx: QueryCtx | ActionCtx, objects: readonly Entity[], subjectType: string): Promise<Set<string>>;
-}
-/**
- * Disjunction.
- *
- * `check` is hybrid: it probes the cheapest child sequentially first, then —
- * only if that misses — races the remaining children in parallel with a
- * first-true early exit. Since `Union.of` cost-sorts its children, the first
- * probe is typically the direct materialised branch (cost 1) and the rest
- * are RT Composes (cost 2+). The common direct-hit path therefore fires
- * exactly one query; the miss path pays one extra round-trip vs pure
- * Promise.all but saves every RT query fired by the current
- * direct-hits-don't-short-circuit shape.
- *
- * `checkBatch` / `checkBatchSubjects` narrow sequentially: the first child
- * sees the full candidate set; later children only see what wasn't already
- * covered. `expand*` union every child's full results — they genuinely need
- * everything.
- */
-export declare class Union implements Traversal {
-    readonly children: readonly Traversal[];
-    readonly cost: number;
-    constructor(children: readonly Traversal[]);
-    /**
-     * Build a Union from an argument list, applying the algebraic identities
-     * that keep plan trees tight:
-     *
-     *   • `EMPTY` children are dropped.
-     *   • Nested `Union`s are flattened one level.
-     *   • Zero children collapse to `EMPTY`.
-     *   • One child collapses to that child (no `Union` wrapper).
-     *   • Surviving children are sorted ascending by `cost`, so later
-     *     `checkBatch` narrowing probes the cheapest paths first.
-     */
-    static of(...children: readonly Traversal[]): Traversal;
-    check(ctx: QueryCtx | ActionCtx, subject: Entity, object: Entity): Promise<boolean>;
-    checkBatch(ctx: QueryCtx | ActionCtx, subject: Entity, objectType: string, candidateIds: readonly string[]): Promise<Set<string>>;
-    checkBatchSubjects(ctx: QueryCtx | ActionCtx, object: Entity, subjectType: string, candidateIds: readonly string[]): Promise<Set<string>>;
-    expandObjects(ctx: QueryCtx | ActionCtx, subject: Entity, objectType: string): Promise<Set<string>>;
-    expandSubjects(ctx: QueryCtx | ActionCtx, object: Entity, subjectType: string): Promise<Set<string>>;
-    expandObjectsFromMany(ctx: QueryCtx | ActionCtx, subjects: readonly Entity[], objectType: string): Promise<Set<string>>;
-    expandSubjectsFromMany(ctx: QueryCtx | ActionCtx, objects: readonly Entity[], subjectType: string): Promise<Set<string>>;
-    /**
-     * Narrowing loop shared by checkBatch / checkBatchSubjects. Each child
-     * only sees candidates the earlier children didn't cover, so the tail
-     * children (typically RT) probe a strictly smaller set.
-     */
-    private _narrow;
-}
-export declare const EMPTY: Traversal;
-/**
- * Compile a Traversal tree for `(relation, objectType)`. `targets` is the
- * inheritance-/userset-expanded set of acceptable relation names. The tree is
- *
- *     Union([ Materialised(targets), ...Compose(edge, plan(...)) ])
- *
- * — a direct materialised lookup unioned with one Compose per applicable
- * read-time path. Collapses to the direct branch when no RT paths apply, and
- * to `EMPTY` when `targets` is empty. Each leaf is one effectiveRelationships
- * query: a direct lookup is one, a single RT dot is two, an N-level RT chain
- * is N+1.
- */
-export declare function planRelation(z: ZbarInternal, objectType: string, targets: readonly string[], depth?: number): Traversal;
-/**
- * Evaluate multiple permissions on a shared `(subject, object)` in the
- * minimum number of queries. Returns the granted permissions in input
- * order.
- */
-export declare function evaluateManyPermissions(z: ZbarInternal, ctx: QueryCtx | ActionCtx, subject: Entity, object: Entity, perms: ReadonlyArray<{
-    permission: string;
-    targets: readonly string[];
-}>): Promise<string[]>;
-/**
- * Forward via: `subject → via[0] → … → via[last] → objects` where objects
- * are enumerated and narrowed to the subjects the permission plan actually
- * grants. Returns the final object-ID set.
- */
-export declare function collectViaObjects(z: ZbarInternal, ctx: QueryCtx | ActionCtx, plan: Traversal, subject: Entity, via: readonly Entity[], objectType: string, acceptableRelations: readonly string[]): Promise<Set<string>>;
-/**
- * Reverse via: `subjects → via[0] → … → via[last] → object`. Returns the
- * subject-ID set narrowed to what the permission plan grants on the pinned
- * `object`.
- */
-export declare function collectViaSubjects(z: ZbarInternal, ctx: QueryCtx | ActionCtx, plan: Traversal, object: Entity, via: readonly Entity[], subjectType: string, acceptableRelations: readonly string[]): Promise<Set<string>>;
+export declare function evaluateManyPermissions(z: ZbarInternal, ctx: Ctx, subject: Entity, object: Entity, permissions: readonly string[]): Promise<string[]>;
+/** Objects of `objectType` that `subject` holds `plan` on, within the structural scope of `via[last]`. */
+export declare function collectViaObjects(z: ZbarInternal, ctx: Ctx, plan: Traversal, subject: Entity, via: readonly Entity[], objectType: string): Promise<Set<string>>;
+/** Subjects of `subjectType` holding `plan` on `object`, within the structural scope of `via[0]`. */
+export declare function collectViaSubjects(z: ZbarInternal, ctx: Ctx, plan: Traversal, object: Entity, via: readonly Entity[], subjectType: string): Promise<Set<string>>;
+export {};
 //# sourceMappingURL=traversal.d.ts.map
